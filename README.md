@@ -115,6 +115,39 @@ To automate the compilation and installation so the driver remains available aft
    sudo ./install.sh
    ```
 
+## Runtime Configuration
+
+The driver supports both dynamic and manual URB/packet configuration. By default, it uses dynamic calculation based on your ALSA buffer settings. You can override this at runtime using the sysfs interface.
+
+### Finding the sysfs Path
+
+You can find the device's sysfs path using `dmesg` or by searching for the device's name in `/sys`:
+
+```bash
+ls /sys/bus/usb/drivers/audiobox96/*/urb_config
+```
+
+The `*` will correspond to your USB bus and port (e.g., `1-1.2:1.0`).
+
+### Manual Configuration
+
+To set a manual configuration, write the desired URB and packet count in the `URBS/PACKETS` format.
+
+**Example: Set both Playback and Capture to 4 URBs and 2 Packets**
+```bash
+echo 4/2 | sudo tee /sys/bus/usb/drivers/audiobox96/*/urb_config
+```
+
+*Note: Changes take effect the next time the audio stream is opened.*
+
+### Reverting to Dynamic Mode
+
+To return to the automatic dynamic configuration, write `dynamic` to the file.
+
+```bash
+echo dynamic | sudo tee /sys/bus/usb/drivers/audiobox96/*/urb_config
+```
+
 ## Reporting Issues & Feedback
 
 When reporting issues, please include:

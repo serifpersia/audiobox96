@@ -24,6 +24,9 @@
 #define NUM_FEEDBACK_URBS       8
 #define FEEDBACK_URB_PACKETS    4
 
+#define AUDIOBOX_URBS           4
+#define AUDIOBOX_PACKETS        2
+
 #define NUM_CHANNELS            2
 #define BYTES_PER_SAMPLE        4
 #define PLAYBACK_FRAME_SIZE     (NUM_CHANNELS * BYTES_PER_SAMPLE)
@@ -50,6 +53,9 @@ struct audiobox_card {
     int capture_urb_packets;
     struct urb **capture_urbs;
     size_t capture_alloc_size;
+
+    int manual_urbs;
+    int manual_packets;
 
     struct usb_anchor playback_anchor;
     struct usb_anchor feedback_anchor;
