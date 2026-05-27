@@ -124,6 +124,15 @@ static void capture_urb_complete(struct urb *urb)
     unsigned long flags;
     bool need_period_elapsed = false;
 
+    struct capture_copy_desc {
+        u8 *src;
+        size_t byte_pos;
+        size_t len;
+        size_t part1_bytes;
+    };
+    struct capture_copy_desc copies[32];
+    int num_copies = 0;
+
     if (urb->status) {
         if (urb->status == -ENOENT || urb->status == -ECONNRESET ||
             urb->status == -ESHUTDOWN || !chip) {
@@ -142,7 +151,7 @@ static void capture_urb_complete(struct urb *urb)
 
     spin_lock_irqsave(&chip->lock, flags);
 
-    for (i = 0; i < urb->number_of_packets; i++) {
+    for (i = 0; i < urb->number_of_packets && num_copies < 32; i++) {
         int status = urb->iso_frame_desc[i].status;
         unsigned int actual_len = urb->iso_frame_desc[i].actual_length;
         unsigned int offset = urb->iso_frame_desc[i].offset;
@@ -150,19 +159,19 @@ static void capture_urb_complete(struct urb *urb)
         if (status == 0 && actual_len >= CAPTURE_FRAME_SIZE) {
             u8 *src = (u8 *)urb->transfer_buffer + offset;
             snd_pcm_uframes_t frames = actual_len / CAPTURE_FRAME_SIZE;
-            size_t byte_pos = frames_to_bytes(runtime, chip->driver_capture_pos);
+            snd_pcm_uframes_t copy_pos = chip->driver_capture_pos;
 
-            // Copy incoming samples to ALSA DMA ring buffer
-            if (chip->driver_capture_pos + frames > runtime->buffer_size) {
-                size_t part1 = runtime->buffer_size - chip->driver_capture_pos;
-                size_t part1_bytes = frames_to_bytes(runtime, part1);
-                size_t part2_bytes = actual_len - part1_bytes;
+            copies[num_copies].src = src;
+            copies[num_copies].byte_pos = frames_to_bytes(runtime, copy_pos);
+            copies[num_copies].len = actual_len;
 
-                memcpy(runtime->dma_area + byte_pos, src, part1_bytes);
-                memcpy(runtime->dma_area, src + part1_bytes, part2_bytes);
+            if (copy_pos + frames > runtime->buffer_size) {
+                size_t part1 = runtime->buffer_size - copy_pos;
+                copies[num_copies].part1_bytes = frames_to_bytes(runtime, part1);
             } else {
-                memcpy(runtime->dma_area + byte_pos, src, actual_len);
+                copies[num_copies].part1_bytes = 0;
             }
+            num_copies++;
 
             chip->driver_capture_pos += frames;
             if (chip->driver_capture_pos >= runtime->buffer_size)
@@ -179,6 +188,20 @@ static void capture_urb_complete(struct urb *urb)
     }
 
     spin_unlock_irqrestore(&chip->lock, flags);
+
+    for (i = 0; i < num_copies; i++) {
+        u8 *src = copies[i].src;
+        size_t byte_pos = copies[i].byte_pos;
+        size_t len = copies[i].len;
+        size_t part1_bytes = copies[i].part1_bytes;
+
+        if (part1_bytes > 0) {
+            memcpy(runtime->dma_area + byte_pos, src, part1_bytes);
+            memcpy(runtime->dma_area, src + part1_bytes, len - part1_bytes);
+        } else {
+            memcpy(runtime->dma_area + byte_pos, src, len);
+        }
+    }
 
     if (need_period_elapsed)
         snd_pcm_period_elapsed(substream);
@@ -211,9 +234,10 @@ static void playback_urb_complete(struct urb *urb)
     snd_pcm_sframes_t avail_frames;
     size_t bytes_to_copy = 0;
     size_t silence_bytes = 0;
-    int i;
+    int i, urb_idx = -1;
     unsigned long flags;
     bool need_period_elapsed = false;
+    unsigned int new_frames = 0;
 
     if (urb->status) {
         if (urb->status == -ENOENT || urb->status == -ECONNRESET ||
@@ -232,6 +256,18 @@ static void playback_urb_complete(struct urb *urb)
     runtime = substream->runtime;
 
     spin_lock_irqsave(&chip->lock, flags);
+
+    for (i = 0; i < chip->num_playback_urbs; i++) {
+        if (chip->playback_urbs[i] == urb) {
+            urb_idx = i;
+            break;
+        }
+    }
+
+    if (urb_idx >= 0) {
+        chip->playback_frames_consumed += chip->playback_urb_frames[urb_idx];
+    }
+    chip->last_urb_completed_time = ktime_get();
 
     for (i = 0; i < urb->number_of_packets; i++) {
         unsigned int frames_for_packet;
@@ -258,19 +294,24 @@ static void playback_urb_complete(struct urb *urb)
             bytes_to_copy = frames_to_bytes(runtime, avail_frames);
             silence_bytes = total_bytes_for_urb - bytes_to_copy;
             chip->driver_playback_pos += avail_frames;
-            chip->playback_frames_consumed += avail_frames;
             chip->period_elapsed_accum += avail_frames;
+            new_frames = avail_frames;
         } else {
             bytes_to_copy = 0;
             silence_bytes = total_bytes_for_urb;
+            new_frames = 0;
         }
     } else {
         bytes_to_copy = total_bytes_for_urb;
         silence_bytes = 0;
         chip->driver_playback_pos += frames_to_copy;
-        chip->playback_frames_consumed += frames_to_copy;
         chip->period_elapsed_accum += frames_to_copy;
+        new_frames = frames_to_copy;
     }
+
+    if (urb_idx >= 0)
+        chip->playback_urb_frames[urb_idx] = new_frames;
+    chip->playback_frames_submitted += new_frames;
 
     if (chip->driver_playback_pos >= runtime->buffer_size)
         chip->driver_playback_pos -= runtime->buffer_size;
@@ -359,30 +400,33 @@ static void feedback_urb_complete(struct urb *urb)
                 u32 nominal_q16 = div_u64((u64)chip->current_rate << 16, 8000);
                 u32 f_shifted = feedback_val;
 
-                if (!chip->freqshift_detected) {
-                    int shift = 0;
-                    while (f_shifted < nominal_q16 - nominal_q16 / 4) {
-                        f_shifted <<= 1;
-                        shift++;
+                if (feedback_val > (nominal_q16 / 2)) {
+                    if (!chip->freqshift_detected) {
+                        int shift = 0;
+                        while (f_shifted < nominal_q16 - nominal_q16 / 4) {
+                            f_shifted <<= 1;
+                            shift++;
+                        }
+                        while (f_shifted > nominal_q16 + nominal_q16 / 2) {
+                            f_shifted >>= 1;
+                            shift--;
+                        }
+                        chip->freqshift = shift;
+                        chip->freqshift_detected = true;
+                    } else {
+                        if (chip->freqshift > 0)
+                            f_shifted <<= chip->freqshift;
+                        else if (chip->freqshift < 0)
+                            f_shifted >>= -chip->freqshift;
                     }
-                    while (f_shifted > nominal_q16 + nominal_q16 / 2) {
-                        f_shifted >>= 1;
-                        shift--;
+
+                    u32 diff = (f_shifted > nominal_q16) ? (f_shifted - nominal_q16) : (nominal_q16 - f_shifted);
+
+                    if (diff < (nominal_q16 / 4)) {
+                        chip->freq_est_q24 = ((u64)chip->freq_est_q24 * 255 + ((u64)f_shifted << 8)) >> 8;
+                        chip->freq_q16 = chip->freq_est_q24 >> 8;
+                        chip->feedback_synced = true;
                     }
-                    chip->freqshift = shift;
-                    chip->freqshift_detected = true;
-                } else {
-                    if (chip->freqshift > 0)
-                        f_shifted <<= chip->freqshift;
-                    else if (chip->freqshift < 0)
-                        f_shifted >>= -chip->freqshift;
-                }
-
-                u32 diff = (f_shifted > nominal_q16) ? (f_shifted - nominal_q16) : (nominal_q16 - f_shifted);
-
-                if (diff < (nominal_q16 / 4)) {
-                    chip->freq_q16 = (chip->freq_q16 * 7 + f_shifted) / 8;
-                    chip->feedback_synced = true;
                 }
             }
         }
@@ -558,12 +602,15 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
     unsigned long flags;
-    int err;
+    int err = 0;
+
+    mutex_lock(&chip->mutex);
 
     spin_lock_irqsave(&chip->lock, flags);
     if (atomic_read(&chip->playback_active)) {
         spin_unlock_irqrestore(&chip->lock, flags);
-        return -EBUSY;
+        err = -EBUSY;
+        goto unlock;
     }
     spin_unlock_irqrestore(&chip->lock, flags);
 
@@ -588,18 +635,15 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
         pkts_period = params_period_size(params) / fpp;
         pkts_buffer = params_buffer_size(params) / fpp;
 
-        chip->playback_urb_packets = max(1, pkts_period / 2);
+        chip->playback_urb_packets = max(4, pkts_period / 2);
         if (chip->playback_urb_packets > 16)
             chip->playback_urb_packets = 16;
 
-        chip->num_playback_urbs = max(2, pkts_buffer / chip->playback_urb_packets);
+        chip->num_playback_urbs = pkts_buffer / chip->playback_urb_packets;
+        if (chip->num_playback_urbs < 16)
+            chip->num_playback_urbs = 16;
         if (chip->num_playback_urbs > 32)
             chip->num_playback_urbs = 32;
-
-        if (chip->num_playback_urbs == 0 || chip->playback_urb_packets == 0) {
-            chip->num_playback_urbs = 8;
-            chip->playback_urb_packets = 4;
-        }
         
         dev_info(&chip->dev->dev, "Dynamic URB config: rate=%u period=%lu buffer=%lu -> urbs=%d packets=%d\n",
                  rate, (unsigned long)params_period_size(params), (unsigned long)params_buffer_size(params),
@@ -609,21 +653,25 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
     if (chip->current_rate != rate) {
         err = audiobox96_set_rate(chip, rate);
         if (err < 0)
-            return err;
+            goto unlock;
         chip->current_rate = rate;
     }
 
     err = audiobox_alloc_urbs(chip);
     if (err < 0)
-        return err;
+        goto unlock;
 
-    return 0;
+unlock:
+    mutex_unlock(&chip->mutex);
+    return err;
 }
 
 static int audiobox_playback_hw_free(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
+    mutex_lock(&chip->mutex);
     audiobox_free_urbs(chip);
+    mutex_unlock(&chip->mutex);
     return 0;
 }
 
@@ -631,8 +679,10 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     struct snd_pcm_runtime *runtime = substream->runtime;
-    int i, u, err;
+    int i, u, err = 0;
     size_t nominal_bytes = (runtime->rate / 8000) * PLAYBACK_FRAME_SIZE;
+
+    mutex_lock(&chip->mutex);
 
     usb_kill_anchored_urbs(&chip->playback_anchor);
     usb_kill_anchored_urbs(&chip->feedback_anchor);
@@ -640,16 +690,20 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
     err = usb_set_interface(chip->dev, AUDIOBOX_PLAYBACK_INTERFACE, 1);
     if (err < 0) {
         dev_err(&chip->dev->dev, "Failed to set altsetting 1: %d\n", err);
-        return err;
+        goto unlock;
     }
 
     chip->driver_playback_pos = 0;
     chip->playback_frames_consumed = 0;
+    chip->playback_frames_submitted = 0;
+    for (i = 0; i < 32; i++)
+        chip->playback_urb_frames[i] = 0;
     chip->period_elapsed_accum = 0;
     chip->feedback_synced = false;
     chip->feedback_urb_skip_count = 4;
     chip->phase_accum = 0;
     chip->freq_q16 = div_u64(((u64)runtime->rate << 16), 8000);
+    chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
 
     chip->freqshift = 0;
     chip->freqshift_detected = false;
@@ -680,7 +734,10 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
         urb->transfer_buffer_length = total_bytes;
         memset(urb->transfer_buffer, 0, total_bytes);
     }
-    return 0;
+
+unlock:
+    mutex_unlock(&chip->mutex);
+    return err;
 }
 
 static snd_pcm_uframes_t audiobox_playback_pointer(struct snd_pcm_substream *substream)
@@ -688,23 +745,38 @@ static snd_pcm_uframes_t audiobox_playback_pointer(struct snd_pcm_substream *sub
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     struct snd_pcm_runtime *runtime = substream->runtime;
     unsigned long flags;
-    u64 pos;
-    int active_pb;
+    snd_pcm_uframes_t pos;
+    u64 submitted, consumed;
+    ktime_t last_completed;
 
     if (!atomic_read(&chip->playback_active))
         return 0;
 
     spin_lock_irqsave(&chip->lock, flags);
-    pos = chip->playback_frames_consumed;
-    active_pb = atomic_read(&chip->active_playback_urbs);
+    pos = chip->driver_playback_pos;
+    submitted = chip->playback_frames_submitted;
+    consumed = chip->playback_frames_consumed;
+    last_completed = chip->last_urb_completed_time;
     spin_unlock_irqrestore(&chip->lock, flags);
 
     if (runtime) {
-        snd_pcm_uframes_t delay = (active_pb * chip->playback_urb_packets * runtime->rate) / 8000;
-        runtime->delay = delay;
+        ktime_t now = ktime_get();
+        ktime_t diff = ktime_sub(now, last_completed);
+        u64 elapsed_us = ktime_to_us(diff);
+        u64 est_frames = div_u64(elapsed_us * runtime->rate, 1000000);
+        
+        u64 max_est = (chip->playback_urb_packets * runtime->rate) / 8000;
+        if (est_frames > max_est)
+            est_frames = max_est;
+
+        u64 in_flight = submitted - consumed;
+        if (in_flight > est_frames)
+            runtime->delay = in_flight - est_frames;
+        else
+            runtime->delay = 0;
     }
 
-    return (snd_pcm_uframes_t)(pos % runtime->buffer_size);
+    return pos;
 }
 
 static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cmd)
@@ -723,6 +795,12 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
                 return 0;
             }
             atomic_set(&chip->playback_active, 1);
+            chip->playback_frames_submitted = 0;
+            chip->playback_frames_consumed = 0;
+            for (i = 0; i < 32; i++)
+                chip->playback_urb_frames[i] = 0;
+            chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
+            chip->last_urb_completed_time = ktime_get();
             chip->feedback_synced = false;
             spin_unlock_irqrestore(&chip->lock, flags);
 
@@ -802,12 +880,15 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
     unsigned long flags;
-    int err;
+    int err = 0;
+
+    mutex_lock(&chip->mutex);
 
     spin_lock_irqsave(&chip->lock, flags);
     if (atomic_read(&chip->capture_active)) {
         spin_unlock_irqrestore(&chip->lock, flags);
-        return -EBUSY;
+        err = -EBUSY;
+        goto unlock;
     }
     spin_unlock_irqrestore(&chip->lock, flags);
 
@@ -829,18 +910,15 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
         pkts_period = DIV_ROUND_UP(params_period_size(params), fpp);
         pkts_buffer = DIV_ROUND_UP(params_buffer_size(params), fpp);
 
-        chip->capture_urb_packets = DIV_ROUND_UP(pkts_period, 2);
+        chip->capture_urb_packets = max(4, DIV_ROUND_UP(pkts_period, 2));
         if (chip->capture_urb_packets > 16)
             chip->capture_urb_packets = 16;
 
-        chip->num_capture_urbs = max(2, pkts_buffer / chip->capture_urb_packets);
+        chip->num_capture_urbs = pkts_buffer / chip->capture_urb_packets;
+        if (chip->num_capture_urbs < 16)
+            chip->num_capture_urbs = 16;
         if (chip->num_capture_urbs > 32)
             chip->num_capture_urbs = 32;
-
-        if (chip->num_capture_urbs == 0 || chip->capture_urb_packets == 0) {
-            chip->num_capture_urbs = 8;
-            chip->capture_urb_packets = 4;
-        }
 
         dev_info(&chip->dev->dev, "Dynamic Capture URB config: rate=%u period=%lu buffer=%lu -> urbs=%d packets=%d\n",
                  rate, (unsigned long)params_period_size(params), (unsigned long)params_buffer_size(params),
@@ -850,35 +928,41 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     if (chip->current_rate != rate) {
         err = audiobox96_set_rate(chip, rate);
         if (err < 0)
-            return err;
+            goto unlock;
         chip->current_rate = rate;
     }
 
     err = audiobox_alloc_capture_urbs(chip);
     if (err < 0)
-        return err;
+        goto unlock;
 
-    return 0;
+unlock:
+    mutex_unlock(&chip->mutex);
+    return err;
 }
 
 static int audiobox_capture_hw_free(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
+    mutex_lock(&chip->mutex);
     audiobox_free_capture_urbs(chip);
+    mutex_unlock(&chip->mutex);
     return 0;
 }
 
 static int audiobox_capture_prepare(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
-    int i, u, err;
+    int i, u, err = 0;
+
+    mutex_lock(&chip->mutex);
 
     usb_kill_anchored_urbs(&chip->capture_anchor);
 
     err = usb_set_interface(chip->dev, AUDIOBOX_RECORD_INTERFACE, 1);
     if (err < 0) {
         dev_err(&chip->dev->dev, "Failed to set record altsetting 1: %d\n", err);
-        return err;
+        goto unlock;
     }
 
     chip->driver_capture_pos = 0;
@@ -898,7 +982,10 @@ static int audiobox_capture_prepare(struct snd_pcm_substream *substream)
         urb->transfer_buffer_length = chip->capture_alloc_size;
         memset(urb->transfer_buffer, 0, chip->capture_alloc_size);
     }
-    return 0;
+
+unlock:
+    mutex_unlock(&chip->mutex);
+    return err;
 }
 
 static snd_pcm_uframes_t audiobox_capture_pointer(struct snd_pcm_substream *substream)
@@ -1052,6 +1139,7 @@ static int audiobox_probe(struct usb_interface *intf, const struct usb_device_id
     atomic_set(&chip->capture_active, 0);
 
     spin_lock_init(&chip->lock);
+    mutex_init(&chip->mutex);
     init_usb_anchor(&chip->playback_anchor);
     init_usb_anchor(&chip->feedback_anchor);
     init_usb_anchor(&chip->capture_anchor);

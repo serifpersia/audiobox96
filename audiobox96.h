@@ -3,6 +3,8 @@
 
 #include <linux/usb.h>
 #include <linux/atomic.h>
+#include <linux/mutex.h>
+#include <linux/ktime.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
@@ -62,12 +64,16 @@ struct audiobox_card {
     struct usb_anchor capture_anchor;
 
     spinlock_t lock;
+    struct mutex mutex;
     atomic_t playback_active;
     atomic_t capture_active;
     atomic_t active_playback_urbs;
     int current_rate;
 
     u64 playback_frames_consumed;
+    u64 playback_frames_submitted;
+    unsigned int playback_urb_frames[32];
+    ktime_t last_urb_completed_time;
     snd_pcm_uframes_t driver_playback_pos;
     snd_pcm_uframes_t period_elapsed_accum;
 
@@ -77,6 +83,7 @@ struct audiobox_card {
 
     u32 phase_accum;
     u32 freq_q16;
+    u64 freq_est_q24;
     bool feedback_synced;
     unsigned int feedback_urb_skip_count;
 
