@@ -11,12 +11,14 @@ An unofficial, low-latency ALSA kernel module for the PreSonus AudioBox USB 96 a
 
 ### To-Do & Known Limitations
 * MIDI IN/OUT (not yet implemented but planned)
+* pipewire-jack use seems to not respect user latency config 
+If user sets latency via PIPEWIRE_LATENCY=buffer/sample rate the driver receives pipewire default 2048(1024/2 periods) configuration. Using normal jack2 doesn't have this issue.
 
 ## Compatibility
 
 This driver has been tested and works reliably with the following audio servers:
 * **PipeWire**
-* **PipeWire-JACK**
+* **PipeWire-JACK** *Currently has issue mentioned above!
 * **JACK2**
 
 ## Performance Optimization
@@ -114,39 +116,6 @@ To automate the compilation and installation so the driver remains available aft
    ```bash
    sudo ./install.sh
    ```
-
-## Runtime Configuration
-
-The driver supports both dynamic and manual URB/packet configuration. By default, it uses dynamic calculation based on your ALSA buffer settings. You can override this at runtime using the sysfs interface.
-
-### Finding the sysfs Path
-
-You can find the device's sysfs path using `dmesg` or by searching for the device's name in `/sys`:
-
-```bash
-ls /sys/bus/usb/drivers/audiobox96/*/urb_config
-```
-
-The `*` will correspond to your USB bus and port (e.g., `1-1.2:1.0`).
-
-### Manual Configuration
-
-To set a manual configuration, write the desired URB and packet count in the `URBS/PACKETS` format.
-
-**Example: Set both Playback and Capture to 4 URBs and 2 Packets**
-```bash
-echo 4/2 | sudo tee /sys/bus/usb/drivers/audiobox96/*/urb_config
-```
-
-*Note: Changes take effect the next time the audio stream is opened.*
-
-### Reverting to Dynamic Mode
-
-To return to the automatic dynamic configuration, write `dynamic` to the file.
-
-```bash
-echo dynamic | sudo tee /sys/bus/usb/drivers/audiobox96/*/urb_config
-```
 
 ## Reporting Issues & Feedback
 

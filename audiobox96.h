@@ -8,6 +8,7 @@
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
+#include <sound/pcm_params.h>
 
 #define DRIVER_NAME "audiobox96"
 
@@ -55,9 +56,6 @@ struct audiobox_card {
     int capture_urb_packets;
     struct urb **capture_urbs;
     size_t capture_alloc_size;
-
-    int manual_urbs;
-    int manual_packets;
 
     struct usb_anchor playback_anchor;
     struct usb_anchor feedback_anchor;

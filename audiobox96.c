@@ -18,7 +18,9 @@ static struct usb_driver audiobox_alsa_driver;
 static const struct snd_pcm_hardware audiobox_playback_hw = {
     .info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
     SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID |
-    SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+    SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
+    SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_NO_PERIOD_WAKEUP |
+    SNDRV_PCM_INFO_SYNC_APPLPTR),
     .formats = SNDRV_PCM_FMTBIT_S32_LE,
     .rates = (SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
     SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000),
@@ -26,17 +28,19 @@ static const struct snd_pcm_hardware audiobox_playback_hw = {
     .rate_max = 96000,
     .channels_min = NUM_CHANNELS,
     .channels_max = NUM_CHANNELS,
-    .buffer_bytes_max = 512 * 1024,
-    .period_bytes_min = 128,
-    .period_bytes_max = 256 * 1024,
+    .buffer_bytes_max = 8192 * PLAYBACK_FRAME_SIZE,
+    .period_bytes_min = 8 * PLAYBACK_FRAME_SIZE,
+    .period_bytes_max = 4096 * PLAYBACK_FRAME_SIZE,
     .periods_min = 2,
-    .periods_max = 1024,
+    .periods_max = 128,
 };
 
 static const struct snd_pcm_hardware audiobox_capture_hw = {
     .info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
     SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_MMAP_VALID |
-    SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
+    SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
+    SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_NO_PERIOD_WAKEUP |
+    SNDRV_PCM_INFO_SYNC_APPLPTR),
     .formats = SNDRV_PCM_FMTBIT_S32_LE,
     .rates = (SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |
     SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000),
@@ -44,50 +48,78 @@ static const struct snd_pcm_hardware audiobox_capture_hw = {
     .rate_max = 96000,
     .channels_min = NUM_CHANNELS,
     .channels_max = NUM_CHANNELS,
-    .buffer_bytes_max = 512 * 1024,
-    .period_bytes_min = 128,
-    .period_bytes_max = 256 * 1024,
+    .buffer_bytes_max = 8192 * CAPTURE_FRAME_SIZE,
+    .period_bytes_min = 8 * CAPTURE_FRAME_SIZE,
+    .period_bytes_max = 4096 * CAPTURE_FRAME_SIZE,
     .periods_min = 2,
-    .periods_max = 1024,
+    .periods_max = 128,
 };
 
 static int audiobox96_set_rate(struct audiobox_card *chip, int rate);
 
-static ssize_t urb_config_show(struct device *dev, struct device_attribute *attr, char *buf)
+static void audiobox_calc_urb_config(unsigned int rate, snd_pcm_uframes_t buffer_size,
+                                     int *out_urbs, int *out_packets)
 {
-    struct audiobox_card *chip = dev_get_drvdata(dev);
-    if (chip->manual_urbs > 0 && chip->manual_packets > 0)
-        return sysfs_emit(buf, "%d/%d\n", chip->manual_urbs, chip->manual_packets);
-    return sysfs_emit(buf, "dynamic\n");
-}
+    /*
+     * Target: packets should be roughly half the buffer duration
+     * to ensure we have a frequent enough interrupt rate.
+     */
+    int target_packets = (buffer_size * 8000) / (rate * 2);
 
-static ssize_t urb_config_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-    struct audiobox_card *chip = dev_get_drvdata(dev);
-    int urbs, packets;
+    if (target_packets < 2) target_packets = 2;
+    if (target_packets > 32) target_packets = 32;
 
-    if (sscanf(buf, "%d/%d", &urbs, &packets) == 2) {
-        chip->manual_urbs = urbs;
-        chip->manual_packets = packets;
-    } else if (strncmp(buf, "dynamic", 7) == 0 || (urbs == 0 && packets == 0)) {
-        chip->manual_urbs = 0;
-        chip->manual_packets = 0;
-    } else {
-        return -EINVAL;
+    *out_packets = target_packets;
+
+    /*
+     * Optimization: For stability, we want a hardware queue of at least 8ms
+     * for low buffers, or 1x the buffer size for large buffers.
+     * 8ms = 64 microframes (packets).
+     */
+    int safety_packets = 64;
+    if (buffer_size > 512) {
+        /* For large buffers, match the hardware queue to the software buffer size */
+        safety_packets = (buffer_size * 8000) / rate;
     }
 
-    return count;
+    *out_urbs = safety_packets / *out_packets;
+
+    /* Boundaries */
+    if (*out_urbs < 4)  *out_urbs = 4;  /* Never less than 4 URBs for rotation */
+        if (*out_urbs > 32) *out_urbs = 32; /* Max array size is 32 */
 }
-static DEVICE_ATTR_RW(urb_config);
 
-static struct attribute *audiobox_attrs[] = {
-    &dev_attr_urb_config.attr,
-    NULL,
-};
+static int hw_rule_buffer_size_by_rate(struct snd_pcm_hw_params *params,
+                                       struct snd_pcm_hw_rule *rule)
+{
+    struct snd_interval *r = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+    struct snd_interval *b = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+    struct snd_interval t;
 
-static const struct attribute_group audiobox_attr_group = {
-    .attrs = audiobox_attrs,
-};
+    snd_interval_any(&t);
+    if (r->min >= 88200) {
+        t.min = 32;
+        t.max = 2048;
+        return snd_interval_refine(b, &t);
+    }
+    return 0;
+}
+
+static int hw_rule_rate_by_buffer_size(struct snd_pcm_hw_params *params,
+                                       struct snd_pcm_hw_rule *rule)
+{
+    struct snd_interval *b = hw_param_interval(params, SNDRV_PCM_HW_PARAM_BUFFER_SIZE);
+    struct snd_interval *r = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+    struct snd_interval t;
+
+    snd_interval_any(&t);
+    if (b->max < 32) {
+        t.min = 44100;
+        t.max = 48000;
+        return snd_interval_refine(r, &t);
+    }
+    return 0;
+}
 
 static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
 {
@@ -114,7 +146,6 @@ static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
     }
     return 0;
 }
-
 static void capture_urb_complete(struct urb *urb)
 {
     struct audiobox_card *chip = urb->context;
@@ -130,6 +161,7 @@ static void capture_urb_complete(struct urb *urb)
         size_t len;
         size_t part1_bytes;
     };
+    /* Reduced to 32 to stay under the 2KB stack frame limit */
     struct capture_copy_desc copies[32];
     int num_copies = 0;
 
@@ -151,6 +183,7 @@ static void capture_urb_complete(struct urb *urb)
 
     spin_lock_irqsave(&chip->lock, flags);
 
+    /* We cap num_copies at 32, which is the max packets per URB in Group C */
     for (i = 0; i < urb->number_of_packets && num_copies < 32; i++) {
         int status = urb->iso_frame_desc[i].status;
         unsigned int actual_len = urb->iso_frame_desc[i].actual_length;
@@ -576,8 +609,27 @@ static int audiobox_alloc_urbs(struct audiobox_card *chip)
 static int audiobox_playback_open(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    int err;
 
-    substream->runtime->hw = audiobox_playback_hw;
+    runtime->hw = audiobox_playback_hw;
+
+    err = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+    if (err < 0)
+        return err;
+
+    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+                              hw_rule_buffer_size_by_rate, NULL,
+                              SNDRV_PCM_HW_PARAM_RATE, -1);
+    if (err < 0)
+        return err;
+
+    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
+                              hw_rule_rate_by_buffer_size, NULL,
+                              SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
+    if (err < 0)
+        return err;
+
     chip->playback_substream = substream;
     atomic_set(&chip->playback_active, 0);
     return 0;
@@ -619,36 +671,13 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
     atomic_set(&chip->active_playback_urbs, 0);
 
     audiobox_free_urbs(chip);
-    
-    if (chip->manual_urbs > 0 && chip->manual_packets > 0) {
-        chip->num_playback_urbs = chip->manual_urbs;
-        chip->playback_urb_packets = chip->manual_packets;
-        dev_info(&chip->dev->dev, "Manual URB config: urbs=%d packets=%d\n",
-                 chip->num_playback_urbs, chip->playback_urb_packets);
-    } else {
-        int fpp, pkts_period, pkts_buffer;
-        
-        fpp = rate / 8000;
-        if (fpp == 0)
-            fpp = 6;
 
-        pkts_period = params_period_size(params) / fpp;
-        pkts_buffer = params_buffer_size(params) / fpp;
+    audiobox_calc_urb_config(rate, params_buffer_size(params),
+                             &chip->num_playback_urbs, &chip->playback_urb_packets);
 
-        chip->playback_urb_packets = max(4, pkts_period / 2);
-        if (chip->playback_urb_packets > 16)
-            chip->playback_urb_packets = 16;
-
-        chip->num_playback_urbs = pkts_buffer / chip->playback_urb_packets;
-        if (chip->num_playback_urbs < 16)
-            chip->num_playback_urbs = 16;
-        if (chip->num_playback_urbs > 32)
-            chip->num_playback_urbs = 32;
-        
-        dev_info(&chip->dev->dev, "Dynamic URB config: rate=%u period=%lu buffer=%lu -> urbs=%d packets=%d\n",
-                 rate, (unsigned long)params_period_size(params), (unsigned long)params_buffer_size(params),
-                 chip->num_playback_urbs, chip->playback_urb_packets);
-    }
+    dev_info(&chip->dev->dev, "Auto Playback URB config: rate=%u buffer=%lu -> urbs=%d packets=%d\n",
+             rate, (unsigned long)params_buffer_size(params),
+             chip->num_playback_urbs, chip->playback_urb_packets);
 
     if (chip->current_rate != rate) {
         err = audiobox96_set_rate(chip, rate);
@@ -661,7 +690,7 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
     if (err < 0)
         goto unlock;
 
-unlock:
+    unlock:
     mutex_unlock(&chip->mutex);
     return err;
 }
@@ -735,7 +764,7 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
         memset(urb->transfer_buffer, 0, total_bytes);
     }
 
-unlock:
+    unlock:
     mutex_unlock(&chip->mutex);
     return err;
 }
@@ -764,7 +793,7 @@ static snd_pcm_uframes_t audiobox_playback_pointer(struct snd_pcm_substream *sub
         ktime_t diff = ktime_sub(now, last_completed);
         u64 elapsed_us = ktime_to_us(diff);
         u64 est_frames = div_u64(elapsed_us * runtime->rate, 1000000);
-        
+
         u64 max_est = (chip->playback_urb_packets * runtime->rate) / 8000;
         if (est_frames > max_est)
             est_frames = max_est;
@@ -799,32 +828,32 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
             chip->playback_frames_consumed = 0;
             for (i = 0; i < 32; i++)
                 chip->playback_urb_frames[i] = 0;
-            chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
-            chip->last_urb_completed_time = ktime_get();
-            chip->feedback_synced = false;
-            spin_unlock_irqrestore(&chip->lock, flags);
+        chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
+        chip->last_urb_completed_time = ktime_get();
+        chip->feedback_synced = false;
+        spin_unlock_irqrestore(&chip->lock, flags);
 
-            for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
-                if (!chip->feedback_urbs[i]) continue;
-                usb_anchor_urb(chip->feedback_urbs[i], &chip->feedback_anchor);
-                if (usb_submit_urb(chip->feedback_urbs[i], GFP_ATOMIC) < 0) {
-                    usb_unanchor_urb(chip->feedback_urbs[i]);
-                    ret = -EIO;
-                    goto error;
-                }
+        for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+            if (!chip->feedback_urbs[i]) continue;
+            usb_anchor_urb(chip->feedback_urbs[i], &chip->feedback_anchor);
+            if (usb_submit_urb(chip->feedback_urbs[i], GFP_ATOMIC) < 0) {
+                usb_unanchor_urb(chip->feedback_urbs[i]);
+                ret = -EIO;
+                goto error;
             }
+        }
 
-            for (i = 0; i < chip->num_playback_urbs; i++) {
-                if (!chip->playback_urbs[i]) continue;
-                usb_anchor_urb(chip->playback_urbs[i], &chip->playback_anchor);
-                if (usb_submit_urb(chip->playback_urbs[i], GFP_ATOMIC) < 0) {
-                    usb_unanchor_urb(chip->playback_urbs[i]);
-                    ret = -EIO;
-                    goto error;
-                }
-                atomic_inc(&chip->active_playback_urbs);
+        for (i = 0; i < chip->num_playback_urbs; i++) {
+            if (!chip->playback_urbs[i]) continue;
+            usb_anchor_urb(chip->playback_urbs[i], &chip->playback_anchor);
+            if (usb_submit_urb(chip->playback_urbs[i], GFP_ATOMIC) < 0) {
+                usb_unanchor_urb(chip->playback_urbs[i]);
+                ret = -EIO;
+                goto error;
             }
-            break;
+            atomic_inc(&chip->active_playback_urbs);
+        }
+        break;
 
         case SNDRV_PCM_TRIGGER_STOP:
         case SNDRV_PCM_TRIGGER_SUSPEND:
@@ -855,8 +884,27 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
 static int audiobox_capture_open(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    int err;
 
-    substream->runtime->hw = audiobox_capture_hw;
+    runtime->hw = audiobox_capture_hw;
+
+    err = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+    if (err < 0)
+        return err;
+
+    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+                              hw_rule_buffer_size_by_rate, NULL,
+                              SNDRV_PCM_HW_PARAM_RATE, -1);
+    if (err < 0)
+        return err;
+
+    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
+                              hw_rule_rate_by_buffer_size, NULL,
+                              SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
+    if (err < 0)
+        return err;
+
     chip->capture_substream = substream;
     atomic_set(&chip->capture_active, 0);
     return 0;
@@ -895,35 +943,12 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     usb_kill_anchored_urbs(&chip->capture_anchor);
     audiobox_free_capture_urbs(chip);
 
-    if (chip->manual_urbs > 0 && chip->manual_packets > 0) {
-        chip->num_capture_urbs = chip->manual_urbs;
-        chip->capture_urb_packets = chip->manual_packets;
-        dev_info(&chip->dev->dev, "Manual Capture URB config: urbs=%d packets=%d\n",
-                 chip->num_capture_urbs, chip->capture_urb_packets);
-    } else {
-        int fpp, pkts_period, pkts_buffer;
-        
-        fpp = rate / 8000;
-        if (fpp == 0)
-            fpp = 6;
+    audiobox_calc_urb_config(rate, params_buffer_size(params),
+                             &chip->num_capture_urbs, &chip->capture_urb_packets);
 
-        pkts_period = DIV_ROUND_UP(params_period_size(params), fpp);
-        pkts_buffer = DIV_ROUND_UP(params_buffer_size(params), fpp);
-
-        chip->capture_urb_packets = max(4, DIV_ROUND_UP(pkts_period, 2));
-        if (chip->capture_urb_packets > 16)
-            chip->capture_urb_packets = 16;
-
-        chip->num_capture_urbs = pkts_buffer / chip->capture_urb_packets;
-        if (chip->num_capture_urbs < 16)
-            chip->num_capture_urbs = 16;
-        if (chip->num_capture_urbs > 32)
-            chip->num_capture_urbs = 32;
-
-        dev_info(&chip->dev->dev, "Dynamic Capture URB config: rate=%u period=%lu buffer=%lu -> urbs=%d packets=%d\n",
-                 rate, (unsigned long)params_period_size(params), (unsigned long)params_buffer_size(params),
-                 chip->num_capture_urbs, chip->capture_urb_packets);
-    }
+    dev_info(&chip->dev->dev, "Auto Capture URB config: rate=%u buffer=%lu -> urbs=%d packets=%d\n",
+             rate, (unsigned long)params_buffer_size(params),
+             chip->num_capture_urbs, chip->capture_urb_packets);
 
     if (chip->current_rate != rate) {
         err = audiobox96_set_rate(chip, rate);
@@ -936,7 +961,7 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     if (err < 0)
         goto unlock;
 
-unlock:
+    unlock:
     mutex_unlock(&chip->mutex);
     return err;
 }
@@ -983,7 +1008,7 @@ static int audiobox_capture_prepare(struct snd_pcm_substream *substream)
         memset(urb->transfer_buffer, 0, chip->capture_alloc_size);
     }
 
-unlock:
+    unlock:
     mutex_unlock(&chip->mutex);
     return err;
 }
@@ -1128,8 +1153,6 @@ static int audiobox_probe(struct usb_interface *intf, const struct usb_device_id
     chip->dev = usb_get_dev(dev);
     chip->card = card;
 
-    chip->manual_urbs = 0;
-    chip->manual_packets = 0;
     chip->num_playback_urbs = AUDIOBOX_URBS;
     chip->playback_urb_packets = AUDIOBOX_PACKETS;
     atomic_set(&chip->active_playback_urbs, 0);
@@ -1143,10 +1166,6 @@ static int audiobox_probe(struct usb_interface *intf, const struct usb_device_id
     init_usb_anchor(&chip->playback_anchor);
     init_usb_anchor(&chip->feedback_anchor);
     init_usb_anchor(&chip->capture_anchor);
-
-    err = sysfs_create_group(&intf->dev.kobj, &audiobox_attr_group);
-    if (err < 0)
-        dev_warn(&dev->dev, "Could not create sysfs group: %d\n", err);
 
     strscpy(card->driver, DRIVER_NAME, sizeof(card->driver));
     strscpy(card->shortname, "AudioBox USB 96", sizeof(card->shortname));
@@ -1220,7 +1239,6 @@ static void audiobox_disconnect(struct usb_interface *intf)
         return;
 
     if (intf->cur_altsetting->desc.bInterfaceNumber == AUDIOBOX_CONTROL_INTERFACE) {
-        sysfs_remove_group(&intf->dev.kobj, &audiobox_attr_group);
         atomic_set(&chip->playback_active, 0);
         atomic_set(&chip->capture_active, 0);
 
@@ -1273,4 +1291,3 @@ static struct usb_driver audiobox_alsa_driver = {
 };
 
 module_usb_driver(audiobox_alsa_driver);
-
