@@ -11,14 +11,12 @@ An unofficial, low-latency ALSA kernel module for the PreSonus AudioBox USB 96 a
 
 ### To-Do & Known Limitations
 * MIDI IN/OUT (not yet implemented but planned)
-* pipewire-jack use seems to not respect user latency config 
-If user sets latency via PIPEWIRE_LATENCY=buffer/sample rate the driver receives pipewire default 2048(1024/2 periods) configuration. Using normal jack2 doesn't have this issue.
 
 ## Compatibility
 
 This driver has been tested and works reliably with the following audio servers:
 * **PipeWire**
-* **PipeWire-JACK** *Currently has issue mentioned above!
+* **PipeWire-JACK**
 * **JACK2**
 
 ## Performance Optimization

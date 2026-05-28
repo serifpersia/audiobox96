@@ -1,3 +1,12 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/**
+ * DOC: PreSonus AudioBox USB 96 Kernel Driver Header
+ *
+ * This header defines the configuration structures, hardware register mappings,
+ * endpoints, and state variables required to interface directly with the
+ * PreSonus AudioBox USB 96 hardware.
+ */
+
 #ifndef __AUDIOBOX96_H
 #define __AUDIOBOX96_H
 
@@ -12,30 +21,38 @@
 
 #define DRIVER_NAME "audiobox96"
 
-#define USB_VID_PRESONUS    0x194f
-#define USB_PID_AUDIOBOX96   0x0303
+#define USB_VID_PRESONUS             0x194f
+#define USB_PID_AUDIOBOX96            0x0303
 
-#define AUDIOBOX_CONTROL_INTERFACE   0
-#define AUDIOBOX_RECORD_INTERFACE    1
-#define AUDIOBOX_PLAYBACK_INTERFACE  2
+#define AUDIOBOX_CONTROL_INTERFACE    0
+#define AUDIOBOX_RECORD_INTERFACE     1
+#define AUDIOBOX_PLAYBACK_INTERFACE   2
 
-#define AUDIOBOX_RECORD_ENDPOINT     0x81
-#define AUDIOBOX_PLAYBACK_ENDPOINT   0x01
-#define AUDIOBOX_FEEDBACK_ENDPOINT   0x82
-#define AUDIOBOX_CLOCK_SOURCE_ID     5
+#define AUDIOBOX_RECORD_ENDPOINT      0x81
+#define AUDIOBOX_PLAYBACK_ENDPOINT    0x01
+#define AUDIOBOX_FEEDBACK_ENDPOINT    0x82
+#define AUDIOBOX_CLOCK_SOURCE_ID      5
 
-#define NUM_FEEDBACK_URBS       8
-#define FEEDBACK_URB_PACKETS    4
+/* Default initialization parameters */
+#define PLAYBACK_URB_COUNT            8
+#define PLAYBACK_PACKET_COUNT         8
+#define CAPTURE_URB_COUNT             8
+#define CAPTURE_PACKET_COUNT          8
 
-#define AUDIOBOX_URBS           4
-#define AUDIOBOX_PACKETS        2
+/* Explicit feedback endpoint properties */
+#define FEEDBACK_URB_COUNT            4
+#define FEEDBACK_PACKET_COUNT         8
 
-#define NUM_CHANNELS            2
-#define BYTES_PER_SAMPLE        4
-#define PLAYBACK_FRAME_SIZE     (NUM_CHANNELS * BYTES_PER_SAMPLE)
-#define CAPTURE_FRAME_SIZE      (NUM_CHANNELS * BYTES_PER_SAMPLE)
+#define NUM_CHANNELS                  2
+#define BYTES_PER_SAMPLE              4
+#define PLAYBACK_FRAME_SIZE           (NUM_CHANNELS * BYTES_PER_SAMPLE)
+#define CAPTURE_FRAME_SIZE            (NUM_CHANNELS * BYTES_PER_SAMPLE)
 
-#define MAX_FRAMES_PER_PACKET   13
+#define MAX_FRAMES_PER_PACKET         13
+
+/* Telemetry configuration switches */
+#define AUDIOBOX_DEBUG_PACING         0
+#define AUDIOBOX_DEBUG_XRUNS          0
 
 struct audiobox_card {
     struct usb_device *dev;
@@ -45,11 +62,13 @@ struct audiobox_card {
     struct snd_pcm_substream *playback_substream;
     struct snd_pcm_substream *capture_substream;
 
+    /* Dynamic allocation arrays to allow 1:1 Latency Profile resizing */
     int num_playback_urbs;
     int playback_urb_packets;
     struct urb **playback_urbs;
     size_t playback_urb_alloc_size;
-    struct urb *feedback_urbs[NUM_FEEDBACK_URBS];
+
+    struct urb *feedback_urbs[FEEDBACK_URB_COUNT];
     size_t feedback_urb_alloc_size;
 
     int num_capture_urbs;
@@ -68,20 +87,23 @@ struct audiobox_card {
     atomic_t active_playback_urbs;
     int current_rate;
 
+    /* Playback positions */
     u64 playback_frames_consumed;
     u64 playback_frames_submitted;
-    unsigned int playback_urb_frames[32];
+    unsigned int *playback_urb_frames;
     ktime_t last_urb_completed_time;
     snd_pcm_uframes_t driver_playback_pos;
     snd_pcm_uframes_t period_elapsed_accum;
 
+    /* Capture positions */
     u64 capture_frames_consumed;
     snd_pcm_uframes_t driver_capture_pos;
     snd_pcm_uframes_t capture_period_elapsed_accum;
 
+    /* Synchronisation State */
     u32 phase_accum;
     u32 freq_q16;
-    u64 freq_est_q24;
+    u64 freq_est_q32;
     bool feedback_synced;
     unsigned int feedback_urb_skip_count;
 
@@ -89,4 +111,4 @@ struct audiobox_card {
     bool freqshift_detected;
 };
 
-#endif
+#endif /* __AUDIOBOX96_H */

@@ -1,3 +1,13 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/**
+ * DOC: PreSonus AudioBox USB 96 ALSA Driver Implementation
+ *
+ * This driver implements asynchronous isochronous playback and capture streaming
+ * for the PreSonus AudioBox USB 96. Hardware-level rate pacing matches explicit
+ * feedback packets from endpoint 0x82 utilizing an integer-only Q32.32 state tracker,
+ * eliminating the need for floating-point calculations in interrupt context.
+ */
+
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -55,40 +65,6 @@ static const struct snd_pcm_hardware audiobox_capture_hw = {
     .periods_max = 128,
 };
 
-static int audiobox96_set_rate(struct audiobox_card *chip, int rate);
-
-static void audiobox_calc_urb_config(unsigned int rate, snd_pcm_uframes_t buffer_size,
-                                     int *out_urbs, int *out_packets)
-{
-    /*
-     * Target: packets should be roughly half the buffer duration
-     * to ensure we have a frequent enough interrupt rate.
-     */
-    int target_packets = (buffer_size * 8000) / (rate * 2);
-
-    if (target_packets < 2) target_packets = 2;
-    if (target_packets > 32) target_packets = 32;
-
-    *out_packets = target_packets;
-
-    /*
-     * Optimization: For stability, we want a hardware queue of at least 8ms
-     * for low buffers, or 1x the buffer size for large buffers.
-     * 8ms = 64 microframes (packets).
-     */
-    int safety_packets = 64;
-    if (buffer_size > 512) {
-        /* For large buffers, match the hardware queue to the software buffer size */
-        safety_packets = (buffer_size * 8000) / rate;
-    }
-
-    *out_urbs = safety_packets / *out_packets;
-
-    /* Boundaries */
-    if (*out_urbs < 4)  *out_urbs = 4;  /* Never less than 4 URBs for rotation */
-        if (*out_urbs > 32) *out_urbs = 32; /* Max array size is 32 */
-}
-
 static int hw_rule_buffer_size_by_rate(struct snd_pcm_hw_params *params,
                                        struct snd_pcm_hw_rule *rule)
 {
@@ -121,6 +97,111 @@ static int hw_rule_rate_by_buffer_size(struct snd_pcm_hw_params *params,
     return 0;
 }
 
+/**
+ * audiobox_calc_urb_config() - Map ALSA buffer limits to exact latency groups
+ * @rate: Active configured sampling rate in Hz.
+ * @period_size: Size of the PCM period in frames.
+ * @buffer_size: Total size of the PCM ring buffer in frames.
+ * @out_urbs: Outputs calculated URB pipeline depth.
+ * @out_packets: Outputs calculated packets per URB.
+ *
+ * Classifies the active streams into Group A (Ultra-Low), Group B (Balanced),
+ * or Group C (Stable) profiles, and then dynamically clamps the hardware queue
+ * size to ensure it never exceeds the total ALSA ring buffer size.
+ */
+static void audiobox_calc_urb_config(unsigned int rate,
+                                     snd_pcm_uframes_t period_size,
+                                     snd_pcm_uframes_t buffer_size,
+                                     int *out_urbs, int *out_packets)
+{
+    int packets_per_urb;
+    u64 samples_per_urb;
+    u64 cushion_num, cushion_den;
+    u64 urbs;
+    u64 frames_per_packet;
+    u64 queue_frames;
+
+    /* 1. Classify Latency Profile Group based on period_size */
+    if (rate == 44100 || rate == 48000) {
+        if (period_size <= 64) {
+            packets_per_urb = 4;   /* Group A: Optimized 0.5ms USB window */
+            cushion_num = 20;      /* 2.0x Safety Cushion */
+            cushion_den = 10;
+        } else if (period_size <= 128) {
+            packets_per_urb = 16;  /* Group B: 2.0ms USB window */
+            cushion_num = 15;      /* 1.5x Safety Cushion */
+            cushion_den = 10;
+        } else {
+            packets_per_urb = 32;  /* Group C: 4.0ms USB window */
+            cushion_num = 10;
+            cushion_den = 10;
+        }
+    } else { /* 88200 or 96000 */
+        if (period_size <= 128) {
+            packets_per_urb = 4;   /* Group A: Optimized 0.5ms USB window */
+            cushion_num = 20;      /* 2.0x Safety Cushion */
+            cushion_den = 10;
+        } else if (period_size <= 256) {
+            packets_per_urb = 16;  /* Group B: 2.0ms USB window */
+            cushion_num = 15;      /* 1.5x Safety Cushion */
+            cushion_den = 10;
+        } else {
+            packets_per_urb = 32;  /* Group C: 4.0ms USB window */
+            cushion_num = 10;
+            cushion_den = 10;
+        }
+    }
+
+    *out_packets = packets_per_urb;
+
+    /* 2. Compute targeted URB pipeline depth */
+    if (packets_per_urb == 32) {
+        if (period_size <= 1024)
+            *out_urbs = 4;
+        else
+            *out_urbs = 6;
+    } else {
+        samples_per_urb = div_u64((u64)packets_per_urb * rate, 8000);
+        urbs = div_u64((u64)period_size * cushion_num, samples_per_urb * cushion_den);
+        urbs = (urbs + 1) & ~1ULL; /* Round up to even */
+
+        if (packets_per_urb == 4) { /* Group A limits */
+            if (urbs < 4) urbs = 4;
+            if (urbs > 8) urbs = 8;
+        } else { /* Group B limits */
+            if (urbs < 4) urbs = 4;
+            if (urbs > 6) urbs = 6;
+        }
+        *out_urbs = (int)urbs;
+    }
+
+    /* 3. STRICT HARDWARE QUEUE CLAMPING */
+    frames_per_packet = rate / 8000;
+    queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+
+    /* If the calculated queue size exceeds the actual ALSA ring buffer size,
+     *      we must scale down to prevent immediate buffer underruns */
+    if (queue_frames > buffer_size) {
+        // Step A: Try reducing URB count to minimum of 4
+        if (*out_urbs > 4) {
+            *out_urbs = 4;
+            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+        }
+
+        // Step B: Halve packets per URB (retaining powers of 2) until it fits
+        while (queue_frames > buffer_size && *out_packets > 1) {
+            *out_packets >>= 1;
+            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+        }
+
+        // Step C: If still too large, reduce URB count to 3 or 2
+        while (queue_frames > buffer_size && *out_urbs > 2) {
+            *out_urbs -= 1;
+            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+        }
+    }
+}
+
 static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
 {
     struct usb_device *dev = chip->dev;
@@ -146,6 +227,70 @@ static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
     }
     return 0;
 }
+
+/**
+ * audiobox96_get_clock_valid() - Fetch Clock Validity status from hardware
+ * @chip: Context structure of the targeted device.
+ * @out_valid: Output parameter storing validity (1 = Valid, 0 = Invalid).
+ *
+ * Executes a class-specific GET_CUR control transfer targetting the
+ * Clock Source unit's validity control address.
+ *
+ * Return: Zero on success, negative error code on failure.
+ */
+static int audiobox96_get_clock_valid(struct audiobox_card *chip, u8 *out_valid)
+{
+    struct usb_device *dev = chip->dev;
+    u8 *valid_buf;
+    int err;
+
+    valid_buf = kmalloc(1, GFP_KERNEL);
+    if (!valid_buf)
+        return -ENOMEM;
+
+    err = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+                          0x01, 0xA1,
+                          (0x02 << 8), (AUDIOBOX_CLOCK_SOURCE_ID << 8) | AUDIOBOX_CONTROL_INTERFACE,
+                          valid_buf, 1, 1000);
+
+    if (err >= 0) {
+        *out_valid = *valid_buf;
+        err = 0;
+    }
+    kfree(valid_buf);
+    return err;
+}
+
+/**
+ * copy_capture_samples() - Transfer frames from URB payload to VMALLOC area
+ * @substream: Target ALSA substream structure.
+ * @pos: Write pointer position in ring buffer (frames).
+ * @src: Pointer to source raw packet memory.
+ * @frames: Sample frames to transfer.
+ *
+ * Copies raw samples from captured isochronous packets to the ALSA capture
+ * ring buffer, safely handling boundary wrap-around calculations.
+ */
+static void copy_capture_samples(struct snd_pcm_substream *substream,
+                                 snd_pcm_uframes_t pos,
+                                 const u8 *src,
+                                 unsigned int frames)
+{
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    unsigned int bytes_to_copy = frames * CAPTURE_FRAME_SIZE;
+    size_t byte_pos = frames_to_bytes(runtime, pos);
+
+    if (pos + frames > runtime->buffer_size) {
+        size_t part1_frames = runtime->buffer_size - pos;
+        size_t part1_bytes = frames_to_bytes(runtime, part1_frames);
+
+        memcpy(runtime->dma_area + byte_pos, src, part1_bytes);
+        memcpy(runtime->dma_area, src + part1_bytes, bytes_to_copy - part1_bytes);
+    } else {
+        memcpy(runtime->dma_area + byte_pos, src, bytes_to_copy);
+    }
+}
+
 static void capture_urb_complete(struct urb *urb)
 {
     struct audiobox_card *chip = urb->context;
@@ -154,16 +299,6 @@ static void capture_urb_complete(struct urb *urb)
     int i;
     unsigned long flags;
     bool need_period_elapsed = false;
-
-    struct capture_copy_desc {
-        u8 *src;
-        size_t byte_pos;
-        size_t len;
-        size_t part1_bytes;
-    };
-    /* Reduced to 32 to stay under the 2KB stack frame limit */
-    struct capture_copy_desc copies[32];
-    int num_copies = 0;
 
     if (urb->status) {
         if (urb->status == -ENOENT || urb->status == -ECONNRESET ||
@@ -181,10 +316,7 @@ static void capture_urb_complete(struct urb *urb)
 
     runtime = substream->runtime;
 
-    spin_lock_irqsave(&chip->lock, flags);
-
-    /* We cap num_copies at 32, which is the max packets per URB in Group C */
-    for (i = 0; i < urb->number_of_packets && num_copies < 32; i++) {
+    for (i = 0; i < urb->number_of_packets; i++) {
         int status = urb->iso_frame_desc[i].status;
         unsigned int actual_len = urb->iso_frame_desc[i].actual_length;
         unsigned int offset = urb->iso_frame_desc[i].offset;
@@ -192,19 +324,10 @@ static void capture_urb_complete(struct urb *urb)
         if (status == 0 && actual_len >= CAPTURE_FRAME_SIZE) {
             u8 *src = (u8 *)urb->transfer_buffer + offset;
             snd_pcm_uframes_t frames = actual_len / CAPTURE_FRAME_SIZE;
-            snd_pcm_uframes_t copy_pos = chip->driver_capture_pos;
+            snd_pcm_uframes_t copy_pos;
 
-            copies[num_copies].src = src;
-            copies[num_copies].byte_pos = frames_to_bytes(runtime, copy_pos);
-            copies[num_copies].len = actual_len;
-
-            if (copy_pos + frames > runtime->buffer_size) {
-                size_t part1 = runtime->buffer_size - copy_pos;
-                copies[num_copies].part1_bytes = frames_to_bytes(runtime, part1);
-            } else {
-                copies[num_copies].part1_bytes = 0;
-            }
-            num_copies++;
+            spin_lock_irqsave(&chip->lock, flags);
+            copy_pos = chip->driver_capture_pos;
 
             chip->driver_capture_pos += frames;
             if (chip->driver_capture_pos >= runtime->buffer_size)
@@ -212,27 +335,14 @@ static void capture_urb_complete(struct urb *urb)
 
             chip->capture_frames_consumed += frames;
             chip->capture_period_elapsed_accum += frames;
-        }
-    }
 
-    while (chip->capture_period_elapsed_accum >= runtime->period_size) {
-        chip->capture_period_elapsed_accum -= runtime->period_size;
-        need_period_elapsed = true;
-    }
+            while (chip->capture_period_elapsed_accum >= runtime->period_size) {
+                chip->capture_period_elapsed_accum -= runtime->period_size;
+                need_period_elapsed = true;
+            }
+            spin_unlock_irqrestore(&chip->lock, flags);
 
-    spin_unlock_irqrestore(&chip->lock, flags);
-
-    for (i = 0; i < num_copies; i++) {
-        u8 *src = copies[i].src;
-        size_t byte_pos = copies[i].byte_pos;
-        size_t len = copies[i].len;
-        size_t part1_bytes = copies[i].part1_bytes;
-
-        if (part1_bytes > 0) {
-            memcpy(runtime->dma_area + byte_pos, src, part1_bytes);
-            memcpy(runtime->dma_area, src + part1_bytes, len - part1_bytes);
-        } else {
-            memcpy(runtime->dma_area + byte_pos, src, len);
+            copy_capture_samples(substream, copy_pos, src, frames);
         }
     }
 
@@ -256,6 +366,35 @@ static void capture_urb_complete(struct urb *urb)
     usb_unanchor_urb(urb);
 }
 
+/**
+ * copy_play_samples() - Read frames from ring buffer and perform S24_LE masking
+ * @runtime: Active ALSA runtime pointer.
+ * @pos: Read pointer position in ring buffer (frames).
+ * @dst: Target payload address of outgoing URB buffer.
+ * @frames: Sample frames to transfer.
+ *
+ * Copies raw PCM samples to target URB memory. Performs explicit 8-bit masking
+ * (`& 0xFFFFFF00`) on S24_LE streams to zero out the unused LSBs of the 32-bit
+ * slot, preventing hardware-level converter anomalies.
+ */
+static void copy_play_samples(struct snd_pcm_runtime *runtime,
+                              snd_pcm_uframes_t pos,
+                              u8 *dst,
+                              unsigned int frames)
+{
+    unsigned int total_samples = frames * NUM_CHANNELS;
+    u32 *dst_32 = (u32 *)dst;
+    u32 *src_32 = (u32 *)runtime->dma_area;
+    unsigned int start_idx = (pos * NUM_CHANNELS);
+    unsigned int total_samples_in_ring = (runtime->buffer_size * NUM_CHANNELS);
+    unsigned int i;
+
+    for (i = 0; i < total_samples; i++) {
+        unsigned int s_idx = (start_idx + i) % total_samples_in_ring;
+        dst_32[i] = src_32[s_idx] & 0xFFFFFF00;
+    }
+}
+
 static void playback_urb_complete(struct urb *urb)
 {
     struct audiobox_card *chip = urb->context;
@@ -264,7 +403,7 @@ static void playback_urb_complete(struct urb *urb)
     size_t total_bytes_for_urb = 0;
     snd_pcm_uframes_t copy_pos;
     snd_pcm_uframes_t frames_to_copy;
-    snd_pcm_sframes_t avail_frames;
+    snd_pcm_sframes_t avail_frames; /* In ALSA, this returns the queued frames ready for playback */
     size_t bytes_to_copy = 0;
     size_t silence_bytes = 0;
     int i, urb_idx = -1;
@@ -319,9 +458,12 @@ static void playback_urb_complete(struct urb *urb)
     urb->transfer_buffer_length = total_bytes_for_urb;
 
     frames_to_copy = bytes_to_frames(runtime, total_bytes_for_urb);
+
+    /* Fetch actual queued frames ready in ALSA ring buffer */
     avail_frames = snd_pcm_playback_hw_avail(runtime);
     copy_pos = chip->driver_playback_pos;
 
+    /* If ready frames are less than the current USB request, we enter the safety underrun state */
     if (avail_frames < (snd_pcm_sframes_t)frames_to_copy) {
         if (avail_frames > 0) {
             bytes_to_copy = frames_to_bytes(runtime, avail_frames);
@@ -335,6 +477,7 @@ static void playback_urb_complete(struct urb *urb)
             new_frames = 0;
         }
     } else {
+        /* Sufficient data is available in the ring buffer */
         bytes_to_copy = total_bytes_for_urb;
         silence_bytes = 0;
         chip->driver_playback_pos += frames_to_copy;
@@ -354,24 +497,24 @@ static void playback_urb_complete(struct urb *urb)
         need_period_elapsed = true;
     }
 
+    /* Throttled Diagnostic Logging: Detect micro-Xruns & scheduling lag */
+    #if AUDIOBOX_DEBUG_XRUNS
+    if (avail_frames < (snd_pcm_sframes_t)frames_to_copy) {
+        dev_warn_ratelimited(&chip->dev->dev,
+                             "[XRUN DETECTED] Required: %lu frames | Available: %ld frames | Pointer Gap: %lu frames\n",
+                             (unsigned long)frames_to_copy, (long)avail_frames,
+                             (unsigned long)(runtime->control->appl_ptr - runtime->status->hw_ptr));
+    }
+    #endif
+
     spin_unlock_irqrestore(&chip->lock, flags);
 
     if (total_bytes_for_urb > 0) {
         u8 *dst_buf = urb->transfer_buffer;
 
         if (bytes_to_copy > 0) {
-            size_t ptr_bytes = frames_to_bytes(runtime, copy_pos);
-            snd_pcm_uframes_t frames_copied = bytes_to_frames(runtime, bytes_to_copy);
-
-            if (copy_pos + frames_copied > runtime->buffer_size) {
-                size_t part1 = runtime->buffer_size - copy_pos;
-                size_t part1_bytes = frames_to_bytes(runtime, part1);
-
-                memcpy(dst_buf, runtime->dma_area + ptr_bytes, part1_bytes);
-                memcpy(dst_buf + part1_bytes, runtime->dma_area, bytes_to_copy - part1_bytes);
-            } else {
-                memcpy(dst_buf, runtime->dma_area + ptr_bytes, bytes_to_copy);
-            }
+            unsigned int frames_copied = bytes_to_frames(runtime, bytes_to_copy);
+            copy_play_samples(runtime, copy_pos, dst_buf, frames_copied);
         }
 
         if (silence_bytes > 0) {
@@ -393,6 +536,13 @@ static void playback_urb_complete(struct urb *urb)
     atomic_dec(&chip->active_playback_urbs);
 }
 
+/**
+ * feedback_urb_complete() - Monitor explicit clock metrics and drive filter
+ * @urb: Completed feedback URB block.
+ *
+ * Parses incoming UAC2 frequency rate measurements, applies bit-shift adjustments,
+ * and passes normalized sample rates into an integer-only Q32.32 single-pole IIR tracking filter.
+ */
 static void feedback_urb_complete(struct urb *urb)
 {
     struct audiobox_card *chip = urb->context;
@@ -456,9 +606,22 @@ static void feedback_urb_complete(struct urb *urb)
                     u32 diff = (f_shifted > nominal_q16) ? (f_shifted - nominal_q16) : (nominal_q16 - f_shifted);
 
                     if (diff < (nominal_q16 / 4)) {
-                        chip->freq_est_q24 = ((u64)chip->freq_est_q24 * 255 + ((u64)f_shifted << 8)) >> 8;
-                        chip->freq_q16 = chip->freq_est_q24 >> 8;
+                        /* High-precision integer-only lock step (preserves sub-Hz accuracy) */
+                        u64 f_val_q32 = (u64)f_shifted << 16;
+                        chip->freq_est_q32 = ((chip->freq_est_q32 * 255) + f_val_q32) >> 8;
+                        chip->freq_q16 = (u32)((chip->freq_est_q32 + 0x8000) >> 16);
                         chip->feedback_synced = true;
+
+                        /* Throttled Diagnostic Logging: Watch physical hardware frequency drift */
+                        #if AUDIOBOX_DEBUG_PACING
+                        static u64 log_counter = 0;
+                        if (log_counter++ % 1000 == 0) {
+                            u64 physical_hz = div_u64(chip->freq_est_q32 * 8000, 65536);
+                            dev_info_ratelimited(&chip->dev->dev,
+                                                 "[PACING STATUS] Synced Rate: %llu Hz | Step Q16: %u\n",
+                                                 physical_hz >> 16, chip->freq_q16);
+                        }
+                        #endif
                     }
                 }
             }
@@ -513,7 +676,10 @@ static void audiobox_free_urbs(struct audiobox_card *chip)
         chip->playback_urbs = NULL;
     }
 
-    for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+    kfree(chip->playback_urb_frames);
+    chip->playback_urb_frames = NULL;
+
+    for (i = 0; i < FEEDBACK_URB_COUNT; i++) {
         if (chip->feedback_urbs[i]) {
             usb_free_coherent(chip->dev, chip->feedback_urb_alloc_size,
                               chip->feedback_urbs[i]->transfer_buffer,
@@ -569,6 +735,10 @@ static int audiobox_alloc_urbs(struct audiobox_card *chip)
     if (!chip->playback_urbs)
         return -ENOMEM;
 
+    chip->playback_urb_frames = kcalloc(chip->num_playback_urbs, sizeof(unsigned int), GFP_KERNEL);
+    if (!chip->playback_urb_frames)
+        return -ENOMEM;
+
     for (i = 0; i < chip->num_playback_urbs; i++) {
         struct urb *urb = usb_alloc_urb(chip->playback_urb_packets, GFP_KERNEL);
         if (!urb)
@@ -586,9 +756,9 @@ static int audiobox_alloc_urbs(struct audiobox_card *chip)
         urb->complete = playback_urb_complete;
     }
 
-    chip->feedback_urb_alloc_size = FEEDBACK_URB_PACKETS * 4;
-    for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
-        struct urb *urb = usb_alloc_urb(FEEDBACK_URB_PACKETS, GFP_KERNEL);
+    chip->feedback_urb_alloc_size = FEEDBACK_PACKET_COUNT * 4;
+    for (i = 0; i < FEEDBACK_URB_COUNT; i++) {
+        struct urb *urb = usb_alloc_urb(FEEDBACK_PACKET_COUNT, GFP_KERNEL);
         if (!urb)
             return -ENOMEM;
         chip->feedback_urbs[i] = urb;
@@ -653,6 +823,9 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
+    /* CHANGE THIS LINE TO CHECK PERIOD SIZE INSTEAD OF BUFFER SIZE */
+    snd_pcm_uframes_t period_size = params_period_size(params);
+    snd_pcm_uframes_t buffer_size = params_buffer_size(params);
     unsigned long flags;
     int err = 0;
 
@@ -672,11 +845,11 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
 
     audiobox_free_urbs(chip);
 
-    audiobox_calc_urb_config(rate, params_buffer_size(params),
+    /* Pass period_size to the calculator */
+    audiobox_calc_urb_config(rate, period_size, buffer_size,
                              &chip->num_playback_urbs, &chip->playback_urb_packets);
 
-    dev_info(&chip->dev->dev, "Auto Playback URB config: rate=%u buffer=%lu -> urbs=%d packets=%d\n",
-             rate, (unsigned long)params_buffer_size(params),
+    dev_info(&chip->dev->dev, "Dynamic Latency Profile Configuration -> Playback URBs: %d, Packets per URB: %d\n",
              chip->num_playback_urbs, chip->playback_urb_packets);
 
     if (chip->current_rate != rate) {
@@ -710,11 +883,20 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
     struct snd_pcm_runtime *runtime = substream->runtime;
     int i, u, err = 0;
     size_t nominal_bytes = (runtime->rate / 8000) * PLAYBACK_FRAME_SIZE;
+    u8 is_clock_valid = 0;
 
     mutex_lock(&chip->mutex);
 
     usb_kill_anchored_urbs(&chip->playback_anchor);
     usb_kill_anchored_urbs(&chip->feedback_anchor);
+
+    /* Block playback start if internal hardware clock is unstable */
+    err = audiobox96_get_clock_valid(chip, &is_clock_valid);
+    if (err < 0 || !is_clock_valid) {
+        dev_err(&chip->dev->dev, "Hardware internal clock indicates INVALID/UNLOCKED status: %d\n", err);
+        err = -EIO;
+        goto unlock;
+    }
 
     err = usb_set_interface(chip->dev, AUDIOBOX_PLAYBACK_INTERFACE, 1);
     if (err < 0) {
@@ -725,25 +907,27 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
     chip->driver_playback_pos = 0;
     chip->playback_frames_consumed = 0;
     chip->playback_frames_submitted = 0;
-    for (i = 0; i < 32; i++)
+    for (i = 0; i < chip->num_playback_urbs; i++)
         chip->playback_urb_frames[i] = 0;
     chip->period_elapsed_accum = 0;
     chip->feedback_synced = false;
-    chip->feedback_urb_skip_count = 4;
+    chip->feedback_urb_skip_count = 100;
     chip->phase_accum = 0;
-    chip->freq_q16 = div_u64(((u64)runtime->rate << 16), 8000);
-    chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
+
+    /* Initialize tracking state in Q32.32 format */
+    chip->freq_est_q32 = ((u64)runtime->rate << 32) / 8000;
+    chip->freq_q16 = (u32)((chip->freq_est_q32 + 0x8000) >> 16);
 
     chip->freqshift = 0;
     chip->freqshift_detected = false;
     atomic_set(&chip->active_playback_urbs, 0);
 
-    for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+    for (i = 0; i < FEEDBACK_URB_COUNT; i++) {
         struct urb *f_urb = chip->feedback_urbs[i];
         if (!f_urb) continue;
-        f_urb->number_of_packets = FEEDBACK_URB_PACKETS;
-        f_urb->transfer_buffer_length = FEEDBACK_URB_PACKETS * 4;
-        for (u = 0; u < FEEDBACK_URB_PACKETS; u++) {
+        f_urb->number_of_packets = FEEDBACK_PACKET_COUNT;
+        f_urb->transfer_buffer_length = FEEDBACK_PACKET_COUNT * 4;
+        for (u = 0; u < FEEDBACK_PACKET_COUNT; u++) {
             f_urb->iso_frame_desc[u].offset = u * 4;
             f_urb->iso_frame_desc[u].length = 4;
         }
@@ -826,14 +1010,13 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
             atomic_set(&chip->playback_active, 1);
             chip->playback_frames_submitted = 0;
             chip->playback_frames_consumed = 0;
-            for (i = 0; i < 32; i++)
+            for (i = 0; i < chip->num_playback_urbs; i++)
                 chip->playback_urb_frames[i] = 0;
-        chip->freq_est_q24 = (u64)chip->freq_q16 << 8;
         chip->last_urb_completed_time = ktime_get();
         chip->feedback_synced = false;
         spin_unlock_irqrestore(&chip->lock, flags);
 
-        for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+        for (i = 0; i < FEEDBACK_URB_COUNT; i++) {
             if (!chip->feedback_urbs[i]) continue;
             usb_anchor_urb(chip->feedback_urbs[i], &chip->feedback_anchor);
             if (usb_submit_urb(chip->feedback_urbs[i], GFP_ATOMIC) < 0) {
@@ -863,7 +1046,7 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
                 if (chip->playback_urbs && chip->playback_urbs[i])
                     usb_unlink_urb(chip->playback_urbs[i]);
             }
-            for (i = 0; i < NUM_FEEDBACK_URBS; i++) {
+            for (i = 0; i < FEEDBACK_URB_COUNT; i++) {
                 if (chip->feedback_urbs[i])
                     usb_unlink_urb(chip->feedback_urbs[i]);
             }
@@ -927,6 +1110,9 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
+    /* CHANGE THIS LINE TO CHECK PERIOD SIZE INSTEAD OF BUFFER SIZE */
+    snd_pcm_uframes_t period_size = params_period_size(params);
+    snd_pcm_uframes_t buffer_size = params_buffer_size(params);
     unsigned long flags;
     int err = 0;
 
@@ -943,11 +1129,11 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     usb_kill_anchored_urbs(&chip->capture_anchor);
     audiobox_free_capture_urbs(chip);
 
-    audiobox_calc_urb_config(rate, params_buffer_size(params),
+    /* Pass period_size to the calculator */
+    audiobox_calc_urb_config(rate, period_size, buffer_size,
                              &chip->num_capture_urbs, &chip->capture_urb_packets);
 
-    dev_info(&chip->dev->dev, "Auto Capture URB config: rate=%u buffer=%lu -> urbs=%d packets=%d\n",
-             rate, (unsigned long)params_buffer_size(params),
+    dev_info(&chip->dev->dev, "Dynamic Latency Profile Configuration -> Capture URBs: %d, Packets per URB: %d\n",
              chip->num_capture_urbs, chip->capture_urb_packets);
 
     if (chip->current_rate != rate) {
@@ -1153,12 +1339,12 @@ static int audiobox_probe(struct usb_interface *intf, const struct usb_device_id
     chip->dev = usb_get_dev(dev);
     chip->card = card;
 
-    chip->num_playback_urbs = AUDIOBOX_URBS;
-    chip->playback_urb_packets = AUDIOBOX_PACKETS;
+    chip->num_playback_urbs = PLAYBACK_URB_COUNT;
+    chip->playback_urb_packets = PLAYBACK_PACKET_COUNT;
     atomic_set(&chip->active_playback_urbs, 0);
 
-    chip->num_capture_urbs = AUDIOBOX_URBS;
-    chip->capture_urb_packets = AUDIOBOX_PACKETS;
+    chip->num_capture_urbs = CAPTURE_URB_COUNT;
+    chip->capture_urb_packets = CAPTURE_PACKET_COUNT;
     atomic_set(&chip->capture_active, 0);
 
     spin_lock_init(&chip->lock);
