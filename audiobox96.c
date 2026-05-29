@@ -98,108 +98,74 @@ static int hw_rule_rate_by_buffer_size(struct snd_pcm_hw_params *params,
 }
 
 /**
- * audiobox_calc_urb_config() - Map ALSA buffer limits to exact latency groups
+ * audiobox_calc_urb_config() - Map ALSA buffer limits to strictly even configurations
  * @rate: Active configured sampling rate in Hz.
  * @period_size: Size of the PCM period in frames.
  * @buffer_size: Total size of the PCM ring buffer in frames.
- * @out_urbs: Outputs calculated URB pipeline depth.
- * @out_packets: Outputs calculated packets per URB.
+ * @out_urbs: Outputs calculated URB pipeline depth (strict even integer).
+ * @out_packets: Outputs calculated packets per URB (strict even power of 2).
  *
- * Classifies the active streams into Group A (Ultra-Low), Group B (Balanced),
- * or Group C (Stable) profiles, and then dynamically clamps the hardware queue
- * size to ensure it never exceeds the total ALSA ring buffer size.
+ * Mathematically targets optimal buffers with low CPU overhead. Clamping enforces
+ * even URB queues down to the buffer limits without introducing odd numbers.
  */
 static void audiobox_calc_urb_config(unsigned int rate,
                                      snd_pcm_uframes_t period_size,
                                      snd_pcm_uframes_t buffer_size,
                                      int *out_urbs, int *out_packets)
 {
-    int packets_per_urb;
-    u64 samples_per_urb;
-    u64 cushion_num, cushion_den;
-    u64 urbs;
-    u64 frames_per_packet;
+    int packets;
+    int urbs;
     u64 queue_frames;
+    u64 frames_per_packet = rate / 8000;
 
-    /* 1. Classify Latency Profile Group based on period_size */
-    if (rate == 44100 || rate == 48000) {
-        if (period_size <= 64) {
-            packets_per_urb = 4;   /* Group A: Optimized 0.5ms USB window */
-            cushion_num = 20;      /* 2.0x Safety Cushion */
-            cushion_den = 10;
-        } else if (period_size <= 128) {
-            packets_per_urb = 16;  /* Group B: 2.0ms USB window */
-            cushion_num = 15;      /* 1.5x Safety Cushion */
-            cushion_den = 10;
-        } else {
-            packets_per_urb = 32;  /* Group C: 4.0ms USB window */
-            cushion_num = 10;
-            cushion_den = 10;
-        }
-    } else { /* 88200 or 96000 */
-        if (period_size <= 128) {
-            packets_per_urb = 4;   /* Group A: Optimized 0.5ms USB window */
-            cushion_num = 20;      /* 2.0x Safety Cushion */
-            cushion_den = 10;
-        } else if (period_size <= 256) {
-            packets_per_urb = 16;  /* Group B: 2.0ms USB window */
-            cushion_num = 15;      /* 1.5x Safety Cushion */
-            cushion_den = 10;
-        } else {
-            packets_per_urb = 32;  /* Group C: 4.0ms USB window */
-            cushion_num = 10;
-            cushion_den = 10;
-        }
-    }
-
-    *out_packets = packets_per_urb;
-
-    /* 2. Compute targeted URB pipeline depth */
-    if (packets_per_urb == 32) {
-        if (period_size <= 1024)
-            *out_urbs = 4;
+    /* 1. Determine packets per URB (strictly an even power of 2) */
+    if (rate <= 48000) {
+        if (period_size <= 32)
+            packets = 2;
+        else if (period_size <= 128)
+            packets = 4;
+        else if (period_size <= 256)
+            packets = 8;
         else
-            *out_urbs = 6;
-    } else {
-        samples_per_urb = div_u64((u64)packets_per_urb * rate, 8000);
-        urbs = div_u64((u64)period_size * cushion_num, samples_per_urb * cushion_den);
-        urbs = (urbs + 1) & ~1ULL; /* Round up to even */
-
-        if (packets_per_urb == 4) { /* Group A limits */
-            if (urbs < 4) urbs = 4;
-            if (urbs > 8) urbs = 8;
-        } else { /* Group B limits */
-            if (urbs < 4) urbs = 4;
-            if (urbs > 6) urbs = 6;
-        }
-        *out_urbs = (int)urbs;
+            packets = 16;
+    } else { /* 88200 or 96000 Hz */
+        if (period_size <= 64)
+            packets = 2;
+        else if (period_size <= 256)
+            packets = 4;
+        else if (period_size <= 512)
+            packets = 8;
+        else
+            packets = 16;
     }
 
-    /* 3. STRICT HARDWARE QUEUE CLAMPING */
-    frames_per_packet = rate / 8000;
-    queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+    /* 2. Determine target URB count (even number) */
+    if (period_size <= 128)
+        urbs = 4;
+    else
+        urbs = 6;
 
-    /* If the calculated queue size exceeds the actual ALSA ring buffer size,
-     *      we must scale down to prevent immediate buffer underruns */
-    if (queue_frames > buffer_size) {
-        // Step A: Try reducing URB count to minimum of 4
-        if (*out_urbs > 4) {
-            *out_urbs = 4;
-            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
-        }
+    /* 3. Strict Hardware Clamping (Ensuring EVEN numbers only) */
+    queue_frames = (u64)urbs * packets * frames_per_packet;
 
-        // Step B: Halve packets per URB (retaining powers of 2) until it fits
-        while (queue_frames > buffer_size && *out_packets > 1) {
-            *out_packets >>= 1;
-            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
+    while (queue_frames > buffer_size) {
+        /* If the queue exceeds the software buffer, step down URB count by 2 */
+        if (urbs > 2) {
+            urbs -= 2;
+        } else if (packets > 2) {
+            /* If URBs are at minimum even count (2), halve packets to next even power of 2 */
+            packets >>= 1;
+        } else {
+            /* Fallback to absolute minimum of 2 URBs with 2 Packets */
+            urbs = 2;
+            packets = 2;
+            break;
         }
-
-        // Step C: If still too large, reduce URB count to 3 or 2
-        while (queue_frames > buffer_size && *out_urbs > 2) {
-            *out_urbs -= 1;
-            queue_frames = (u64)(*out_urbs) * (*out_packets) * frames_per_packet;
-        }
+        queue_frames = (u64)urbs * packets * frames_per_packet;
     }
+
+    *out_urbs = urbs;
+    *out_packets = packets;
 }
 
 static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
@@ -232,11 +198,6 @@ static int audiobox96_set_rate(struct audiobox_card *chip, int rate)
  * audiobox96_get_clock_valid() - Fetch Clock Validity status from hardware
  * @chip: Context structure of the targeted device.
  * @out_valid: Output parameter storing validity (1 = Valid, 0 = Invalid).
- *
- * Executes a class-specific GET_CUR control transfer targetting the
- * Clock Source unit's validity control address.
- *
- * Return: Zero on success, negative error code on failure.
  */
 static int audiobox96_get_clock_valid(struct audiobox_card *chip, u8 *out_valid)
 {
@@ -263,13 +224,6 @@ static int audiobox96_get_clock_valid(struct audiobox_card *chip, u8 *out_valid)
 
 /**
  * copy_capture_samples() - Transfer frames from URB payload to VMALLOC area
- * @substream: Target ALSA substream structure.
- * @pos: Write pointer position in ring buffer (frames).
- * @src: Pointer to source raw packet memory.
- * @frames: Sample frames to transfer.
- *
- * Copies raw samples from captured isochronous packets to the ALSA capture
- * ring buffer, safely handling boundary wrap-around calculations.
  */
 static void copy_capture_samples(struct snd_pcm_substream *substream,
                                  snd_pcm_uframes_t pos,
@@ -299,6 +253,7 @@ static void capture_urb_complete(struct urb *urb)
     int i;
     unsigned long flags;
     bool need_period_elapsed = false;
+    bool trigger_xrun = false;
 
     if (urb->status) {
         if (urb->status == -ENOENT || urb->status == -ECONNRESET ||
@@ -325,8 +280,29 @@ static void capture_urb_complete(struct urb *urb)
             u8 *src = (u8 *)urb->transfer_buffer + offset;
             snd_pcm_uframes_t frames = actual_len / CAPTURE_FRAME_SIZE;
             snd_pcm_uframes_t copy_pos;
+            snd_pcm_sframes_t used_space;
+            snd_pcm_sframes_t avail_space;
 
             spin_lock_irqsave(&chip->lock, flags);
+
+            /* Monotonic calculation of space availability */
+            if (chip->capture_frames_consumed >= runtime->control->appl_ptr) {
+                used_space = chip->capture_frames_consumed - runtime->control->appl_ptr;
+            } else {
+                used_space = (chip->capture_frames_consumed + runtime->boundary) - runtime->control->appl_ptr;
+            }
+            avail_space = runtime->buffer_size - used_space;
+
+            /* Check for hardware capture overrun */
+            if (avail_space < (snd_pcm_sframes_t)frames) {
+                if (runtime->status->state == SNDRV_PCM_STATE_RUNNING) {
+                    trigger_xrun = true;
+                }
+                dev_err_ratelimited(&chip->dev->dev,
+                                    "[XRUN CAPTURE] Overrun! Free Space: %ld / %lu frames\n",
+                                    (long)avail_space, (unsigned long)runtime->buffer_size);
+            }
+
             copy_pos = chip->driver_capture_pos;
 
             chip->driver_capture_pos += frames;
@@ -334,6 +310,9 @@ static void capture_urb_complete(struct urb *urb)
                 chip->driver_capture_pos -= runtime->buffer_size;
 
             chip->capture_frames_consumed += frames;
+            if (chip->capture_frames_consumed >= runtime->boundary)
+                chip->capture_frames_consumed -= runtime->boundary;
+
             chip->capture_period_elapsed_accum += frames;
 
             while (chip->capture_period_elapsed_accum >= runtime->period_size) {
@@ -341,6 +320,11 @@ static void capture_urb_complete(struct urb *urb)
                 need_period_elapsed = true;
             }
             spin_unlock_irqrestore(&chip->lock, flags);
+
+            if (trigger_xrun) {
+                snd_pcm_stop_xrun(substream);
+                trigger_xrun = false;
+            }
 
             copy_capture_samples(substream, copy_pos, src, frames);
         }
@@ -368,14 +352,6 @@ static void capture_urb_complete(struct urb *urb)
 
 /**
  * copy_play_samples() - Read frames from ring buffer and perform S24_LE masking
- * @runtime: Active ALSA runtime pointer.
- * @pos: Read pointer position in ring buffer (frames).
- * @dst: Target payload address of outgoing URB buffer.
- * @frames: Sample frames to transfer.
- *
- * Copies raw PCM samples to target URB memory. Performs explicit 8-bit masking
- * (`& 0xFFFFFF00`) on S24_LE streams to zero out the unused LSBs of the 32-bit
- * slot, preventing hardware-level converter anomalies.
  */
 static void copy_play_samples(struct snd_pcm_runtime *runtime,
                               snd_pcm_uframes_t pos,
@@ -403,12 +379,13 @@ static void playback_urb_complete(struct urb *urb)
     size_t total_bytes_for_urb = 0;
     snd_pcm_uframes_t copy_pos;
     snd_pcm_uframes_t frames_to_copy;
-    snd_pcm_sframes_t avail_frames; /* In ALSA, this returns the queued frames ready for playback */
+    snd_pcm_sframes_t avail_frames;
     size_t bytes_to_copy = 0;
     size_t silence_bytes = 0;
     int i, urb_idx = -1;
     unsigned long flags;
     bool need_period_elapsed = false;
+    bool trigger_xrun = false;
     unsigned int new_frames = 0;
 
     if (urb->status) {
@@ -438,6 +415,8 @@ static void playback_urb_complete(struct urb *urb)
 
     if (urb_idx >= 0) {
         chip->playback_frames_consumed += chip->playback_urb_frames[urb_idx];
+        if (chip->playback_frames_consumed >= runtime->boundary)
+            chip->playback_frames_consumed -= runtime->boundary;
     }
     chip->last_urb_completed_time = ktime_get();
 
@@ -459,12 +438,25 @@ static void playback_urb_complete(struct urb *urb)
 
     frames_to_copy = bytes_to_frames(runtime, total_bytes_for_urb);
 
-    /* Fetch actual queued frames ready in ALSA ring buffer */
-    avail_frames = snd_pcm_playback_hw_avail(runtime);
+    /* Monotonic calculation of ring buffer vacancy */
+    if (runtime->control->appl_ptr >= chip->playback_frames_submitted) {
+        avail_frames = runtime->control->appl_ptr - chip->playback_frames_submitted;
+    } else {
+        avail_frames = (runtime->control->appl_ptr + runtime->boundary) - chip->playback_frames_submitted;
+    }
+
     copy_pos = chip->driver_playback_pos;
 
-    /* If ready frames are less than the current USB request, we enter the safety underrun state */
+    /* Check for software playback starvation and trigger XRUN */
     if (avail_frames < (snd_pcm_sframes_t)frames_to_copy) {
+        if (runtime->status->state == SNDRV_PCM_STATE_RUNNING) {
+            trigger_xrun = true;
+        }
+
+        dev_err_ratelimited(&chip->dev->dev,
+                            "[XRUN PLAYBACK] Starvation! Buffer level: %ld / %lu frames\n",
+                            (long)avail_frames, (unsigned long)runtime->buffer_size);
+
         if (avail_frames > 0) {
             bytes_to_copy = frames_to_bytes(runtime, avail_frames);
             silence_bytes = total_bytes_for_urb - bytes_to_copy;
@@ -477,7 +469,6 @@ static void playback_urb_complete(struct urb *urb)
             new_frames = 0;
         }
     } else {
-        /* Sufficient data is available in the ring buffer */
         bytes_to_copy = total_bytes_for_urb;
         silence_bytes = 0;
         chip->driver_playback_pos += frames_to_copy;
@@ -487,7 +478,10 @@ static void playback_urb_complete(struct urb *urb)
 
     if (urb_idx >= 0)
         chip->playback_urb_frames[urb_idx] = new_frames;
+
     chip->playback_frames_submitted += new_frames;
+    if (chip->playback_frames_submitted >= runtime->boundary)
+        chip->playback_frames_submitted -= runtime->boundary;
 
     if (chip->driver_playback_pos >= runtime->buffer_size)
         chip->driver_playback_pos -= runtime->buffer_size;
@@ -497,17 +491,12 @@ static void playback_urb_complete(struct urb *urb)
         need_period_elapsed = true;
     }
 
-    /* Throttled Diagnostic Logging: Detect micro-Xruns & scheduling lag */
-    #if AUDIOBOX_DEBUG_XRUNS
-    if (avail_frames < (snd_pcm_sframes_t)frames_to_copy) {
-        dev_warn_ratelimited(&chip->dev->dev,
-                             "[XRUN DETECTED] Required: %lu frames | Available: %ld frames | Pointer Gap: %lu frames\n",
-                             (unsigned long)frames_to_copy, (long)avail_frames,
-                             (unsigned long)(runtime->control->appl_ptr - runtime->status->hw_ptr));
-    }
-    #endif
-
     spin_unlock_irqrestore(&chip->lock, flags);
+
+    if (trigger_xrun) {
+        snd_pcm_stop_xrun(substream);
+        trigger_xrun = false;
+    }
 
     if (total_bytes_for_urb > 0) {
         u8 *dst_buf = urb->transfer_buffer;
@@ -538,10 +527,6 @@ static void playback_urb_complete(struct urb *urb)
 
 /**
  * feedback_urb_complete() - Monitor explicit clock metrics and drive filter
- * @urb: Completed feedback URB block.
- *
- * Parses incoming UAC2 frequency rate measurements, applies bit-shift adjustments,
- * and passes normalized sample rates into an integer-only Q32.32 single-pole IIR tracking filter.
  */
 static void feedback_urb_complete(struct urb *urb)
 {
@@ -606,22 +591,10 @@ static void feedback_urb_complete(struct urb *urb)
                     u32 diff = (f_shifted > nominal_q16) ? (f_shifted - nominal_q16) : (nominal_q16 - f_shifted);
 
                     if (diff < (nominal_q16 / 4)) {
-                        /* High-precision integer-only lock step (preserves sub-Hz accuracy) */
                         u64 f_val_q32 = (u64)f_shifted << 16;
                         chip->freq_est_q32 = ((chip->freq_est_q32 * 255) + f_val_q32) >> 8;
                         chip->freq_q16 = (u32)((chip->freq_est_q32 + 0x8000) >> 16);
                         chip->feedback_synced = true;
-
-                        /* Throttled Diagnostic Logging: Watch physical hardware frequency drift */
-                        #if AUDIOBOX_DEBUG_PACING
-                        static u64 log_counter = 0;
-                        if (log_counter++ % 1000 == 0) {
-                            u64 physical_hz = div_u64(chip->freq_est_q32 * 8000, 65536);
-                            dev_info_ratelimited(&chip->dev->dev,
-                                                 "[PACING STATUS] Synced Rate: %llu Hz | Step Q16: %u\n",
-                                                 physical_hz >> 16, chip->freq_q16);
-                        }
-                        #endif
                     }
                 }
             }
@@ -823,7 +796,6 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
-    /* CHANGE THIS LINE TO CHECK PERIOD SIZE INSTEAD OF BUFFER SIZE */
     snd_pcm_uframes_t period_size = params_period_size(params);
     snd_pcm_uframes_t buffer_size = params_buffer_size(params);
     unsigned long flags;
@@ -845,11 +817,11 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
 
     audiobox_free_urbs(chip);
 
-    /* Pass period_size to the calculator */
+    /* Compute clean even-numbered configuration */
     audiobox_calc_urb_config(rate, period_size, buffer_size,
                              &chip->num_playback_urbs, &chip->playback_urb_packets);
 
-    dev_info(&chip->dev->dev, "Dynamic Latency Profile Configuration -> Playback URBs: %d, Packets per URB: %d\n",
+    dev_info(&chip->dev->dev, "Latency Configuration -> Playback URBs: %d, Packets per URB: %d\n",
              chip->num_playback_urbs, chip->playback_urb_packets);
 
     if (chip->current_rate != rate) {
@@ -890,10 +862,9 @@ static int audiobox_playback_prepare(struct snd_pcm_substream *substream)
     usb_kill_anchored_urbs(&chip->playback_anchor);
     usb_kill_anchored_urbs(&chip->feedback_anchor);
 
-    /* Block playback start if internal hardware clock is unstable */
     err = audiobox96_get_clock_valid(chip, &is_clock_valid);
     if (err < 0 || !is_clock_valid) {
-        dev_err(&chip->dev->dev, "Hardware internal clock indicates INVALID/UNLOCKED status: %d\n", err);
+        dev_err(&chip->dev->dev, "Hardware internal clock INVALID status: %d\n", err);
         err = -EIO;
         goto unlock;
     }
@@ -982,7 +953,7 @@ static snd_pcm_uframes_t audiobox_playback_pointer(struct snd_pcm_substream *sub
         if (est_frames > max_est)
             est_frames = max_est;
 
-        u64 in_flight = submitted - consumed;
+        u64 in_flight = (submitted >= consumed) ? (submitted - consumed) : ((submitted + runtime->boundary) - consumed);
         if (in_flight > est_frames)
             runtime->delay = in_flight - est_frames;
         else
@@ -1067,29 +1038,8 @@ static int audiobox_playback_trigger(struct snd_pcm_substream *substream, int cm
 static int audiobox_capture_open(struct snd_pcm_substream *substream)
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
-    struct snd_pcm_runtime *runtime = substream->runtime;
-    int err;
-
-    runtime->hw = audiobox_capture_hw;
-
-    err = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
-    if (err < 0)
-        return err;
-
-    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
-                              hw_rule_buffer_size_by_rate, NULL,
-                              SNDRV_PCM_HW_PARAM_RATE, -1);
-    if (err < 0)
-        return err;
-
-    err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
-                              hw_rule_rate_by_buffer_size, NULL,
-                              SNDRV_PCM_HW_PARAM_BUFFER_SIZE, -1);
-    if (err < 0)
-        return err;
-
-    chip->capture_substream = substream;
     atomic_set(&chip->capture_active, 0);
+    chip->capture_substream = substream;
     return 0;
 }
 
@@ -1110,7 +1060,6 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
 {
     struct audiobox_card *chip = snd_pcm_substream_chip(substream);
     unsigned int rate = params_rate(params);
-    /* CHANGE THIS LINE TO CHECK PERIOD SIZE INSTEAD OF BUFFER SIZE */
     snd_pcm_uframes_t period_size = params_period_size(params);
     snd_pcm_uframes_t buffer_size = params_buffer_size(params);
     unsigned long flags;
@@ -1129,11 +1078,11 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
     usb_kill_anchored_urbs(&chip->capture_anchor);
     audiobox_free_capture_urbs(chip);
 
-    /* Pass period_size to the calculator */
+    /* Compute clean even-numbered configuration */
     audiobox_calc_urb_config(rate, period_size, buffer_size,
                              &chip->num_capture_urbs, &chip->capture_urb_packets);
 
-    dev_info(&chip->dev->dev, "Dynamic Latency Profile Configuration -> Capture URBs: %d, Packets per URB: %d\n",
+    dev_info(&chip->dev->dev, "Latency Configuration -> Capture URBs: %d, Packets per URB: %d\n",
              chip->num_capture_urbs, chip->capture_urb_packets);
 
     if (chip->current_rate != rate) {
