@@ -323,7 +323,7 @@ static void capture_urb_complete(struct urb *urb)
 
             if (trigger_xrun) {
                 snd_pcm_stop_xrun(substream);
-                trigger_xrun = false;
+                break;
             }
 
             copy_capture_samples(substream, copy_pos, src, frames);
@@ -358,16 +358,22 @@ static void copy_play_samples(struct snd_pcm_runtime *runtime,
                               u8 *dst,
                               unsigned int frames)
 {
-    unsigned int total_samples = frames * NUM_CHANNELS;
     u32 *dst_32 = (u32 *)dst;
     u32 *src_32 = (u32 *)runtime->dma_area;
-    unsigned int start_idx = (pos * NUM_CHANNELS);
-    unsigned int total_samples_in_ring = (runtime->buffer_size * NUM_CHANNELS);
-    unsigned int i;
+    unsigned int total_samples = frames * NUM_CHANNELS;
+    unsigned int buf_samples = runtime->buffer_size * NUM_CHANNELS;
+    unsigned int start_idx = pos * NUM_CHANNELS;
+    unsigned int first_chunk, i;
 
-    for (i = 0; i < total_samples; i++) {
-        unsigned int s_idx = (start_idx + i) % total_samples_in_ring;
-        dst_32[i] = src_32[s_idx] & 0xFFFFFF00;
+    if (start_idx + total_samples > buf_samples) {
+        first_chunk = buf_samples - start_idx;
+        for (i = 0; i < first_chunk; i++)
+            dst_32[i] = src_32[start_idx + i] & 0xFFFFFF00;
+        for (i = 0; i < total_samples - first_chunk; i++)
+            dst_32[first_chunk + i] = src_32[i] & 0xFFFFFF00;
+    } else {
+        for (i = 0; i < total_samples; i++)
+            dst_32[i] = src_32[start_idx + i] & 0xFFFFFF00;
     }
 }
 
@@ -495,10 +501,9 @@ static void playback_urb_complete(struct urb *urb)
 
     if (trigger_xrun) {
         snd_pcm_stop_xrun(substream);
-        trigger_xrun = false;
-    }
-
-    if (total_bytes_for_urb > 0) {
+        if (total_bytes_for_urb > 0)
+            memset(urb->transfer_buffer, 0, total_bytes_for_urb);
+    } else if (total_bytes_for_urb > 0) {
         u8 *dst_buf = urb->transfer_buffer;
 
         if (bytes_to_copy > 0) {
@@ -561,7 +566,7 @@ static void feedback_urb_complete(struct urb *urb)
             if (len == 3) {
                 feedback_val = (data[0] | (data[1] << 8) | (data[2] << 16));
             } else {
-                feedback_val = le32_to_cpup((__le32 *)data) & 0x0fffffff;
+                feedback_val = le32_to_cpup((__le32 *)data);
             }
 
             if (feedback_val > 0) {
@@ -742,7 +747,7 @@ static int audiobox_alloc_urbs(struct audiobox_card *chip)
         urb->dev = chip->dev;
         urb->pipe = usb_rcvisocpipe(chip->dev, AUDIOBOX_FEEDBACK_ENDPOINT);
         urb->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
-        urb->interval = 4;
+        urb->interval = 8;
         urb->context = chip;
         urb->complete = feedback_urb_complete;
     }
@@ -786,6 +791,10 @@ static int audiobox_playback_close(struct snd_pcm_substream *substream)
     usb_kill_anchored_urbs(&chip->playback_anchor);
     usb_kill_anchored_urbs(&chip->feedback_anchor);
 
+    mutex_lock(&chip->mutex);
+    audiobox_free_urbs(chip);
+    mutex_unlock(&chip->mutex);
+
     usb_set_interface(chip->dev, AUDIOBOX_PLAYBACK_INTERFACE, 0);
     chip->playback_substream = NULL;
     return 0;
@@ -825,6 +834,11 @@ static int audiobox_playback_hw_params(struct snd_pcm_substream *substream,
              chip->num_playback_urbs, chip->playback_urb_packets);
 
     if (chip->current_rate != rate) {
+        if (atomic_read(&chip->capture_active)) {
+            dev_err(&chip->dev->dev, "Cannot change rate while capture is active\n");
+            err = -EBUSY;
+            goto unlock;
+        }
         err = audiobox96_set_rate(chip, rate);
         if (err < 0)
             goto unlock;
@@ -1086,6 +1100,11 @@ static int audiobox_capture_hw_params(struct snd_pcm_substream *substream,
              chip->num_capture_urbs, chip->capture_urb_packets);
 
     if (chip->current_rate != rate) {
+        if (atomic_read(&chip->playback_active)) {
+            dev_err(&chip->dev->dev, "Cannot change rate while playback is active\n");
+            err = -EBUSY;
+            goto unlock;
+        }
         err = audiobox96_set_rate(chip, rate);
         if (err < 0)
             goto unlock;
