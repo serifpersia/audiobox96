@@ -109,6 +109,13 @@ struct audiobox_card {
 
     int freqshift;
     bool freqshift_detected;
+
+    /* Diagnostics counters & metrics */
+    u32 playback_xrun_count;
+    u32 capture_xrun_count;
+    u64 playback_completion_count;
+    u64 playback_jitter_max_ns;
+    u64 playback_jitter_sum_ns;
 };
 
 #endif /* __AUDIOBOX96_H */
